@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Acceso · Suite Académica</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--g:#085041;--gl:#e1f5ee;--r:#A32D2D;--rl:#fcebeb;--brd:#d0cec8;--txt:#1a1917;--txt2:#5c5a55;--txt3:#8f8d88}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:linear-gradient(135deg,#f0efeb 0%,#e8e6e0 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem}
+.wrap{width:100%;max-width:400px}
+.logo{text-align:center;margin-bottom:2rem}
+.logo h1{font-size:22px;font-weight:700;color:var(--g);margin-bottom:.25rem}
+.logo p{font-size:13px;color:var(--txt3)}
+.logo-mark{width:56px;height:56px;background:var(--g);border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:24px}
+.card{background:#fff;border:1px solid var(--brd);border-radius:14px;padding:2rem;box-shadow:0 4px 24px rgba(0,0,0,.07)}
+.card h2{font-size:18px;font-weight:600;color:var(--txt);margin-bottom:.25rem}
+.card-sub{font-size:13px;color:var(--txt3);margin-bottom:1.5rem}
+.field{margin-bottom:1rem}
+.field label{display:block;font-size:12px;font-weight:600;color:var(--txt2);margin-bottom:.375rem}
+.field input{width:100%;padding:10px 12px;border:1.5px solid var(--brd);border-radius:8px;font-size:14px;color:var(--txt);transition:border .15s;background:#fff}
+.field input:focus{outline:none;border-color:var(--g)}
+.btn{width:100%;padding:12px;background:var(--g);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:opacity .15s;margin-top:.5rem}
+.btn:hover:not(:disabled){opacity:.87}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.error{background:var(--rl);color:var(--r);border-radius:8px;padding:.75rem 1rem;font-size:13px;margin-top:1rem;display:none;line-height:1.5}
+.msg{background:var(--gl);color:var(--g);border-radius:8px;padding:.75rem 1rem;font-size:13px;margin-top:1rem;display:none}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.footer{text-align:center;margin-top:1.5rem;font-size:12px;color:var(--txt3)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">
+    <div class="logo-mark">📚</div>
+    <h1>Suite Académica</h1>
+    <p>Preguntas test · Resúmenes · Mapas · Maquetación · Historial</p>
+  </div>
+  <div class="card">
+    <h2>Iniciar sesión</h2>
+    <p class="card-sub">Acceso restringido a usuarios autorizados</p>
+    <div class="field">
+      <label for="username">Usuario</label>
+      <input type="text" id="username" placeholder="Nombre de usuario" autocomplete="username" autofocus>
+    </div>
+    <div class="field">
+      <label for="password">Contraseña</label>
+      <input type="password" id="password" placeholder="Contraseña" autocomplete="current-password">
+    </div>
+    <button class="btn" id="btnLogin" onclick="doLogin()">Entrar</button>
+    <div class="error" id="errorBox"></div>
+    <div class="msg" id="msgBox"></div>
+  </div>
+  <div class="footer">Suite Académica para Moodle · v7.0</div>
+</div>
+<script>
+const params = new URLSearchParams(window.location.search);
+if (params.get('msg') === 'session_expired') {
+  const m = document.getElementById('msgBox');
+  m.textContent = 'Tu sesión ha expirado. Inicia sesión de nuevo.';
+  m.style.display = 'block';
+}
+document.addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+
+async function doLogin() {
+  const btn = document.getElementById('btnLogin');
+  const err = document.getElementById('errorBox');
+  const u   = document.getElementById('username').value.trim();
+  const p   = document.getElementById('password').value;
+  if (!u || !p) { showErr('Introduce usuario y contraseña.'); return; }
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Verificando...';
+  err.style.display = 'none';
+
+  try {
+    const res  = await fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username:u, password:p}) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Error de autenticación.');
+    window.location.href = '/';
+  } catch(e) {
+    showErr(e.message);
+    btn.disabled = false;
+    btn.textContent = 'Entrar';
+    document.getElementById('password').value = '';
+    document.getElementById('password').focus();
+  }
+}
+
+function showErr(msg) {
+  const el = document.getElementById('errorBox');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+</script>
+</body>
+</html>
