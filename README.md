@@ -1,4 +1,4 @@
-# Suite Académica para Moodle · v7.0
+# Suite Académica para Moodle · v8.0
 
 Aplicación web para generar preguntas tipo test, resúmenes, mapas conceptuales y documentos maquetados para virtualización a partir de archivos Word y PDF.
 

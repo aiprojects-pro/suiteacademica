@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Suite Académica · Moodle v7</title>
+<title>Suite Académica · Moodle v8.0</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -244,7 +244,7 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
 <header class="topbar">
   <div class="brand"><h1>Suite Académica para Moodle</h1><p>Preguntas test · Resúmenes · Mapas · Maquetación · Historial · Plantillas de color</p></div>
   <div style="display:flex;align-items:center;gap:10px">
-    <span class="badge">v7.0</span>
+    <span class="badge">v8.0</span>
     <button class="user-btn" id="userBtn" onclick="openPanel()">
       <span class="user-dot"></span>
       <span id="userBtnLabel">Cargando...</span>
@@ -379,6 +379,43 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
       <div class="card-title">Maquetación SCORMXPRESS</div>
       <div class="field"><div class="flbl">Documento a maquetar</div><div class="tsel" id="maqSel"></div></div>
       <div style="font-size:11px;color:var(--txt3);line-height:1.5">Se detecta la estructura automáticamente. PDFs grandes se procesan por <strong>secciones</strong> con progreso en tiempo real.</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Autoevaluación integrada</div>
+      <div class="field">
+        <div class="flbl">Incluir preguntas al final</div>
+        <div class="seg" id="segMaqQ">
+          <button class="on" onclick="setMaqQuiz(false)">No</button>
+          <button onclick="setMaqQuiz(true)">Sí</button>
+        </div>
+      </div>
+      <div id="maqQuizOpts" style="display:none">
+        <div class="field">
+          <div class="flbl">Tipo de pregunta</div>
+          <div class="seg3" id="segMaqQType">
+            <button onclick="setCfg('maqQuizType','vf');actSeg('segMaqQType',0)">V / F</button>
+            <button class="on" onclick="setCfg('maqQuizType','3opt');actSeg('segMaqQType',1)">3 opciones</button>
+            <button onclick="setCfg('maqQuizType','4opt');actSeg('segMaqQType',2)">4 opciones</button>
+          </div>
+          <div id="maqQTypeHint" style="font-size:11px;color:var(--txt3);margin-top:3px">Una sola respuesta correcta · A, B, C</div>
+        </div>
+        <div class="field">
+          <div class="flbl">Cantidad de preguntas</div>
+          <div class="rrow">
+            <input type="range" id="maqQNumR" min="3" max="30" step="1" value="10" oninput="syncMaqQNum(this.value)">
+            <span class="rv" id="maqQNumV">10</span>
+          </div>
+        </div>
+        <div class="field">
+          <div class="flbl">Dificultad</div>
+          <div class="seg3" id="segMaqQDiff">
+            <button onclick="setCfg('maqQuizDiff','bajo');actSeg('segMaqQDiff',0)">Baja</button>
+            <button class="on" onclick="setCfg('maqQuizDiff','medio');actSeg('segMaqQDiff',1)">Media</button>
+            <button onclick="setCfg('maqQuizDiff','alto');actSeg('segMaqQDiff',2)">Alta</button>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--amb);background:var(--ambl);border-radius:var(--rad-s);padding:.5rem .75rem;line-height:1.5;margin-top:.375rem">Las preguntas y las soluciones se generarán al final del Word maquetado, en una página independiente cada bloque.</div>
+      </div>
     </div>
     <div class="card">
       <div class="card-title">Plantilla de color</div>
@@ -531,6 +568,7 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
       <div class="card-title" style="color:var(--amb)">Documento maquetado ✓</div>
       <div id="maTruncWarn" style="display:none" class="trunc-warn">⚠ El documento era muy extenso para procesarlo completo. Se maquetó la primera parte. Para documentos muy largos, divide en secciones.</div>
       <div id="maChunkOk" style="display:none" class="info-ok"></div>
+      <div id="maQuizBanner" style="display:none" class="info-warn"></div>
       <div class="maq-stat" id="maStats"></div>
       <div style="font-size:12px;font-weight:500;color:var(--txt2);margin-bottom:.5rem">Estructura detectada (títulos):</div>
       <div class="maq-outline" id="maOutline"></div>
@@ -559,7 +597,7 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
 <script>
 const $ = id => document.getElementById(id);
 let topics=[], qResults=[], mapSVG='', mapW=0, mapH=0, busy=false, qActiveTab=0;
-let maqData=null, maqTopicId=null;
+let maqData=null, maqTopicId=null, maqQuiz=null;
 let currentUser=null;
 let historyItems=[], histFilter='';
 let templates=[], activeTplId='default-scormxpress', customColors=null;
@@ -573,7 +611,9 @@ const cfg = {
   polarityMode:'positive', polarityPositivePct:80,
   minW:30, maxW:80,
   expMode:'unico', penalty:'none',
-  pages:3, mapDepth:'completo'
+  pages:3, mapDepth:'completo',
+  // Maquetación → autoevaluación integrada
+  maqQuizEnabled:false, maqQuizType:'3opt', maqQuizNum:10, maqQuizDiff:'medio'
 };
 const MAP_COLORS=[{bg:'#e1f5ee',s:'#085041',t:'#04342C'},{bg:'#e6f1fb',s:'#185FA5',t:'#042C53'},{bg:'#faece7',s:'#993C1D',t:'#4A1B0C'},{bg:'#EEEDFE',s:'#534AB7',t:'#26215C'},{bg:'#faeeda',s:'#854F0B',t:'#412402'},{bg:'#EAF3DE',s:'#3B6D11',t:'#173404'},{bg:'#FBEAF0',s:'#993556',t:'#4B1528'}];
 
@@ -589,6 +629,8 @@ function setLen(mn,mx){cfg.minW=mn;cfg.maxW=mx;$('mnR').value=mn;$('mnV').textCo
 function syncPages(v){cfg.pages=+v;$('pagesV').textContent=v+' pág.';$('pagesW').textContent='≈ '+(+v*480)+' palabras';refreshUI('s');}
 function setExp(m){cfg.expMode=m;['unico','separados','zip'].forEach(x=>{const el=$('exp'+x.charAt(0).toUpperCase()+x.slice(1));if(el)el.classList.toggle('on',x===m);});}
 function setPenalty(p){cfg.penalty=p;['none','third','half','full'].forEach(x=>$('pen-'+x).classList.toggle('on',x===p));const h={none:'Sin penalización (solo efecto en GIFT).',third:'Penaliza -1/3 pregunta por error (solo en GIFT).',half:'Penaliza -1/2 pregunta por error (solo en GIFT).',full:'Penaliza -1 pregunta completa por error (solo en GIFT).'};$('penHint').textContent=h[p];}
+function setMaqQuiz(on){cfg.maqQuizEnabled=!!on;document.querySelectorAll('#segMaqQ button').forEach((b,i)=>b.classList.toggle('on',(i===0&&!on)||(i===1&&on)));$('maqQuizOpts').style.display=on?'block':'none';}
+function syncMaqQNum(v){cfg.maqQuizNum=+v;$('maqQNumV').textContent=v;}
 $('nqR').oninput=e=>{cfg.numQ=+e.target.value;$('nqN').value=e.target.value;refreshUI();};
 $('nqN').oninput=e=>{const v=Math.min(200,Math.max(1,+e.target.value||1));cfg.numQ=v;$('nqR').value=v;refreshUI();};
 
@@ -642,6 +684,11 @@ function refreshUI(tab){
         $('maSelectedInfo').innerHTML=`📄 <strong>${esc(tp.name.replace(/\.[^.]+$/,''))}</strong> · ${tp.type.toUpperCase()}${pgNote}${tp.words?' · '+tp.words.toLocaleString()+' palabras':''}${imgNote}${largeNote}`;
       }
     }
+    // Hint para tipo de pregunta integrada
+    const qth={vf:'Verdadero / Falso · una afirmación por pregunta',
+               '3opt':'Una sola respuesta correcta · A, B, C',
+               '4opt':'Una sola respuesta correcta · A, B, C, D'};
+    const qte=$('maqQTypeHint');if(qte)qte.textContent=qth[cfg.maqQuizType]||'';
     renderTplChips();
   }
 }
@@ -810,7 +857,7 @@ function aikenToGift(aikenText,penalty){
   const pm={none:null,third:-33.33333,half:-50,full:-100};const pp=pm[penalty];
   function escG(s){return s.replace(/([~={#}:])/g,'\\$1');}
   const lines=aikenText.split('\n');
-  let out='// GIFT — Suite Académica Moodle v7.0\n// Penalización: '+penalty+'\n\n';
+  let out='// GIFT — Suite Académica Moodle v8.0\n// Penalización: '+penalty+'\n\n';
   let i=0,qn=0;
   while(i<lines.length){
     const line=lines[i].trim();
@@ -995,7 +1042,7 @@ function dlMapSvg(){if(!mapSVG)return;dlTxt(mapSVG,'mapa_conceptual.svg');}
 // ── Maquetación (SSE con chunking) ────────────────────────────────────────────
 async function genMaqueta(){
   const selIds=getSelected('maq');if(!selIds.length||busy)return;
-  busy=true;maqData=null;maqTopicId=selIds[0];
+  busy=true;maqData=null;maqTopicId=selIds[0];maqQuiz=null;
   showPanel('ma','progress');
   $('maProgBar').style.width='0%';$('maProgPct').textContent='0%';
   $('maProgLbl').textContent='Iniciando...';$('maChunkInfo').textContent='';
@@ -1040,27 +1087,50 @@ async function genMaqueta(){
         if(!outline.children.length)outline.innerHTML='<div style="color:var(--txt3);font-size:12px">Sin títulos detectados. El contenido se estructuró como párrafos.</div>';
         renderTplChips();
         showPanel('ma','results');
+        // Generar autoevaluación integrada si está activada
+        if(cfg.maqQuizEnabled){generateMaqQuiz();}
+        else{$('maQuizBanner').style.display='none';}
         // Historial
         const tp=topics.find(t=>t.id===maqTopicId);
-        saveToHistory('maqueta',maqData.title||(tp?tp.name.replace(/\.[^.]+$/,''):'Documento'),{titles:h1c+h2c+h3c,paragraphs:pc,lists:lc,images:ic,chunked:ev.mode==='chunked',chunks:ev.processedChunks||null,topicName:tp?.name||null},{data:maqData,topicId:maqTopicId});
+        saveToHistory('maqueta',maqData.title||(tp?tp.name.replace(/\.[^.]+$/,''):'Documento'),{titles:h1c+h2c+h3c,paragraphs:pc,lists:lc,images:ic,chunked:ev.mode==='chunked',chunks:ev.processedChunks||null,topicName:tp?.name||null,quiz:cfg.maqQuizEnabled?{type:cfg.maqQuizType,num:cfg.maqQuizNum,diff:cfg.maqQuizDiff}:null},{data:maqData,topicId:maqTopicId});
       }
     });
   }catch(e){showErr('ma','Error: '+e.message);showPanel('ma','actions');}
   busy=false;
 }
+
+async function generateMaqQuiz(){
+  const banner=$('maQuizBanner');if(!banner)return;
+  banner.style.display='block';
+  banner.innerHTML=`<span class="spin">⟳</span> Generando ${cfg.maqQuizNum} preguntas de autoevaluación (${cfg.maqQuizType==='vf'?'V/F':cfg.maqQuizType==='3opt'?'3 opciones':'4 opciones'} · dificultad ${cfg.maqQuizDiff})...`;
+  try{
+    const res=await fetch('/api/maqueta-quiz',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topicId:maqTopicId,type:cfg.maqQuizType,num:cfg.maqQuizNum,diff:cfg.maqQuizDiff})});
+    const data=await res.json();
+    if(!res.ok||!data.success)throw new Error(data.error||'Error generando autoevaluación');
+    maqQuiz={type:data.type,questions:data.questions||[]};
+    if(!maqQuiz.questions.length)throw new Error('No se obtuvieron preguntas válidas');
+    const tipoLbl=data.type==='vf'?'Verdadero/Falso':data.type==='3opt'?'3 opciones':'4 opciones';
+    banner.innerHTML=`✓ Autoevaluación generada: <strong>${maqQuiz.questions.length} preguntas</strong> (${tipoLbl} · dif. ${cfg.maqQuizDiff}) · se incluirán al final del Word con sus soluciones.`;
+  }catch(e){
+    maqQuiz=null;
+    banner.innerHTML=`<span style="color:var(--r)">⚠ No se pudo generar la autoevaluación: ${esc(e.message)}. El Word se generará sin ella.</span>`;
+  }
+}
+
 async function dlMaquetaDocx(){
   if(!maqData)return;
   try{
     const body={data:maqData,topicId:maqTopicId};
     if(customColors){body.colors=customColors;}
     else if(activeTplId){body.templateId=activeTplId;}
+    if(maqQuiz&&maqQuiz.questions&&maqQuiz.questions.length){body.quiz=maqQuiz;}
     const res=await fetch('/api/maqueta-docx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!res.ok){const e=await res.json().catch(()=>({error:'Error'}));throw new Error(e.error||'Error');}
     const blob=await res.blob();const u=URL.createObjectURL(blob);
     const a=document.createElement('a');a.href=u;a.download=`${safeName(maqData.title||'documento')}_maquetado.docx`;a.click();URL.revokeObjectURL(u);
   }catch(e){showErr('ma','Error: '+e.message);}
 }
-function resetMaqueta(){maqData=null;maqTopicId=null;showPanel('ma','actions');refreshUI('ma');}
+function resetMaqueta(){maqData=null;maqTopicId=null;maqQuiz=null;showPanel('ma','actions');refreshUI('ma');}
 
 // ── Plantillas de color ───────────────────────────────────────────────────────
 async function loadTemplates(){

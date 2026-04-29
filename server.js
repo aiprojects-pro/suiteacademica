@@ -313,7 +313,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 });
 
 app.get('/api/health', (_req, res) => res.json({
-  status:'ok', model:MODEL, version:'7.0.0', users:loadUsers().length,
+  status:'ok', model:MODEL, version:'8.0.0', users:loadUsers().length,
   limits: { maqChunk:MAQ_CHUNK, maqSingle:MAQ_SINGLE, historyLimit:HISTORY_LIMIT }
 }));
 
@@ -429,7 +429,7 @@ function buildSummaryDoc(name, text) {
 }
 
 // ── Maquetación: Word con colores personalizables (plantilla) ─────────────────
-function buildMaquetadoDoc(data, imageStore, colors) {
+function buildMaquetadoDoc(data, imageStore, colors, quiz) {
   // colors es un objeto de la plantilla aplicada
   const C = colors || DEFAULT_TEMPLATES[0].colors;
   const CH1 = C.h1, CH2 = C.h2, CH3 = C.h3;
@@ -501,8 +501,94 @@ function buildMaquetadoDoc(data, imageStore, colors) {
       }
     }
   }
+
+  // ── Sección de autoevaluación (opcional) ────────────────────────────────────
+  if (quiz && Array.isArray(quiz.questions) && quiz.questions.length > 0) {
+    const qLetters = ['A','B','C','D','E'];
+    // Cabecera de la sección
+    children.push(new Paragraph({
+      heading:HeadingLevel.HEADING_1,
+      children:[new TextRun({text:'AUTOEVALUACIÓN', font:'Arial', size:30, bold:true, color:CH1})],
+      spacing:{before:600, after:200},
+      border:{bottom:{style:BorderStyle.SINGLE,size:6,color:CL1}},
+      pageBreakBefore:true
+    }));
+    const intro = quiz.type === 'vf'
+      ? 'Indica si cada afirmación es Verdadera (V) o Falsa (F). Las soluciones se encuentran al final.'
+      : `Selecciona la única respuesta correcta de cada pregunta. Las soluciones se encuentran al final.`;
+    children.push(new Paragraph({
+      children:[new TextRun({text:intro, font:'Arial', size:22, italics:true, color:'5c5a55'})],
+      spacing:{before:0, after:240},
+      alignment:AlignmentType.JUSTIFIED
+    }));
+
+    // Preguntas
+    quiz.questions.forEach((q, i) => {
+      // Enunciado
+      children.push(new Paragraph({
+        children:[
+          new TextRun({text:`${i+1}. `, font:'Arial', size:22, bold:true}),
+          new TextRun({text:q.q || '', font:'Arial', size:22})
+        ],
+        spacing:{before:200, after:100},
+        alignment:AlignmentType.JUSTIFIED
+      }));
+      // Opciones
+      if (quiz.type === 'vf') {
+        children.push(new Paragraph({
+          children:[
+            new TextRun({text:'☐ Verdadero            ☐ Falso', font:'Arial', size:22})
+          ],
+          indent:{left:360},
+          spacing:{before:0, after:80}
+        }));
+      } else {
+        const opts = q.options || [];
+        opts.forEach((opt, j) => {
+          children.push(new Paragraph({
+            children:[
+              new TextRun({text:`${qLetters[j]}.  `, font:'Arial', size:22, bold:true}),
+              new TextRun({text:opt, font:'Arial', size:22})
+            ],
+            indent:{left:360},
+            spacing:{before:0, after:60}
+          }));
+        });
+      }
+    });
+
+    // Soluciones
+    children.push(new Paragraph({
+      heading:HeadingLevel.HEADING_1,
+      children:[new TextRun({text:'SOLUCIONES', font:'Arial', size:30, bold:true, color:CH1})],
+      spacing:{before:600, after:200},
+      border:{bottom:{style:BorderStyle.SINGLE,size:6,color:CL1}},
+      pageBreakBefore:true
+    }));
+    quiz.questions.forEach((q, i) => {
+      let ans = '';
+      if (quiz.type === 'vf') {
+        ans = q.correct ? 'Verdadero' : 'Falso';
+      } else {
+        ans = qLetters[q.correct] || '?';
+      }
+      const runs = [
+        new TextRun({text:`${i+1}.  `, font:'Arial', size:22, bold:true}),
+        new TextRun({text:`Respuesta correcta: ${ans}`, font:'Arial', size:22, bold:true, color:CH2})
+      ];
+      if (q.explanation) {
+        runs.push(new TextRun({text:` — ${q.explanation}`, font:'Arial', size:21, color:'5c5a55'}));
+      }
+      children.push(new Paragraph({
+        children:runs,
+        spacing:{before:120, after:80},
+        alignment:AlignmentType.JUSTIFIED
+      }));
+    });
+  }
+
   return makeDoc(children, data.title || 'Documento',
-    'Maquetado SCORMXPRESS · Suite Académica v7.0',
+    'Maquetado SCORMXPRESS · Suite Académica v8.0',
     CBD, CBD,
     { h1Size:30, h1Color:CH1, h2Size:26, h2Color:CH2, h3Size:24, h3Color:CH3, headerColor:HDR }
   );
@@ -556,6 +642,20 @@ DIRECTRICES OBLIGATORIAS:
 6. Los párrafos deben ser unidades de texto completas y coherentes. No cortes frases.
 7. No uses negritas dentro del texto de los párrafos; usa h2 o h3 para resaltar términos clave.${imgNote}${chunkNote}
 
+REGLAS CRÍTICAS PARA NO CONFUNDIR ELEMENTOS CON TÍTULOS (esto es donde más fallan los modelos):
+- Un h1/h2/h3 debe ir SIEMPRE seguido de contenido sustancial (al menos un párrafo de varias frases o varios elementos de lista). NO marques como título un texto si tras él no hay desarrollo, o sólo hay otro título inmediato.
+- ELEMENTOS DE LISTA: viñetas, ítems numerados (a), b), c) — 1º, 2º, 3º — i, ii, iii — •, –, *) NUNCA se marcan como h1/h2/h3. Van como items dentro de "ul" u "ol".
+- EPÍGRAFES CORTOS / ETIQUETAS DE CAMPO: textos breves que actúan como rótulo seguidos del valor en la misma frase, tipo "OBJETIVO:", "REQUISITOS:", "DEFINICIÓN:", "PLAZO:", "EJEMPLO:", "ART. 5:" → NO son títulos. Inclúyelos dentro del párrafo, integrando el valor: "El objetivo es…", "Los requisitos son los siguientes:".
+- ARTÍCULOS / APARTADOS NUMERADOS dentro de un texto normativo: "Artículo 5.-", "Apartado a)", "Punto 3.1.", "Disposición Adicional Primera" → si son cabecera de un articulado completo con varios párrafos debajo, sí pueden ser h2/h3; si son sólo numeración de un punto dentro de una enumeración, van como item de lista o dentro del párrafo.
+- FRASES EN MAYÚSCULAS sueltas o de énfasis: si no introducen un bloque sustancial, son énfasis dentro del texto, no títulos. Inclúyelas en mayúsculas al inicio del párrafo correspondiente.
+- PIES DE IMAGEN, citas, notas al pie: van como párrafo, NUNCA como título.
+- En caso de duda entre marcar un texto como título o como párrafo: elige PÁRRAFO. Es mucho peor crear títulos falsos que perder algún subtítulo.
+
+REGLA DE COHERENCIA JERÁRQUICA:
+- No saltes niveles (no pongas h3 si el padre lógico no es h2).
+- No abras un h1 nuevo dentro de la misma sección temática; usa h2.
+- Si solo hay UNA subsección bajo un h1, no hace falta crear un h2.
+
 Devuelve ÚNICAMENTE JSON válido (sin texto antes ni después, sin \`\`\`json) con esta estructura:
 {
   "title": "Título del documento (vacío si es sección intermedia)",
@@ -579,13 +679,13 @@ function parseMaqJson(raw) {
   return data;
 }
 
-// ── Prompts de preguntas test (anti-meta + polaridad) ─────────────────────────
-function buildQuestionsPrompt(topic, nQ, type, diff, minW, maxW, numOpts, polarity, extra) {
+// ── Prompts de preguntas test (anti-meta + polaridad + anti-repetición) ──────
+function buildQuestionsPrompt(topic, nQ, type, diff, minW, maxW, numOpts, polarity, extra, previousStems = []) {
   const letters = LETTERS.slice(0, numOpts);
   const dM = {
-    bajo:  'BAJA — definiciones directas, recuerdo de conceptos.',
-    medio: 'MEDIA — comprensión y aplicación, distinciones entre ideas.',
-    alto:  'ALTA — análisis, síntesis, resolución de supuestos complejos.'
+    bajo:  `BAJA — preguntas sobre definiciones directas, datos concretos y conceptos básicos. Las opciones distractoras pueden ser claramente diferenciables. La respuesta correcta debe ser localizable de forma literal en el contenido.`,
+    medio: `MEDIA — preguntas que exigen comprensión y aplicación. Combinan dos o más conceptos, requieren identificar relaciones, comparar definiciones cercanas o aplicar una regla a un caso simple. Las distractoras deben ser plausibles para quien sólo conozca el tema superficialmente.`,
+    alto:  `ALTA — preguntas de análisis y síntesis. Exigen distinguir entre conceptos próximos, identificar excepciones, matices, plazos exactos, requisitos acumulativos, jurisprudencia o aplicación a casos complejos. TODAS las opciones deben ser plausibles para alguien que domine el tema; sólo el dominio profundo permite acertar.`
   };
   const tM = {
     teorico:  'TEÓRICAS: sobre conceptos, principios, definiciones y marco normativo.',
@@ -601,10 +701,37 @@ function buildQuestionsPrompt(topic, nQ, type, diff, minW, maxW, numOpts, polari
     polarityInstr = 'FORMULACIÓN MIXTA: combina preguntas en positivo y preguntas en negativo según las proporciones indicadas por el usuario. En las negativas usa formulaciones tipo "NO es", "señala la incorrecta", "todas excepto", "cuál es falsa".';
   }
 
-  return `Genera EXACTAMENTE ${nQ} preguntas tipo test en ESPAÑOL en formato Aiken para Moodle.
-Opciones: ${numOpts} (${letters.join(', ')}) · Tipo: ${tM[type]} · Dificultad: ${dM[diff]}
-Extensión del enunciado: ${minW}-${maxW} palabras · Fuente: EXCLUSIVAMENTE el contenido proporcionado.
+  // Anti-repetición: lista de enunciados ya generados en este tema
+  let antiRep = '';
+  if (previousStems && previousStems.length) {
+    const sample = previousStems.slice(-40); // últimos 40 enunciados
+    antiRep = `\nPREGUNTAS YA GENERADAS EN ESTE TEMA (PROHIBIDO REPETIR ni reformular con misma estructura/concepto):\n${sample.map((s,i)=>`${i+1}. ${s.substring(0,140)}`).join('\n')}\nDebes proponer enunciados sobre conceptos, datos o aspectos DISTINTOS a los anteriores y con una formulación gramatical claramente DIFERENTE.\n`;
+  }
+
+  return `Genera EXACTAMENTE ${nQ} preguntas tipo test en ESPAÑOL en formato Aiken para Moodle, con CALIDAD DE EXAMEN OFICIAL DE OPOSICIÓN.
+
+NIVEL DE DIFICULTAD OBLIGATORIO PARA TODAS LAS PREGUNTAS DE ESTE LOTE: ${dM[diff]}
+NO mezcles dificultades. TODAS las ${nQ} preguntas deben ajustarse al mismo nivel descrito arriba.
+
+OPCIONES: ${numOpts} (${letters.join(', ')}) · TIPO: ${tM[type]}
+EXTENSIÓN del enunciado: ${minW}-${maxW} palabras · FUENTE: EXCLUSIVAMENTE el contenido proporcionado.
 ${polarityInstr}
+
+REGLAS DE UNICIDAD Y VARIEDAD ESTRUCTURAL (CRÍTICAS):
+1. UNICIDAD: cada pregunta debe ser ÚNICA en concepto, enfoque y formulación. PROHIBIDO repetir el mismo asunto desde otro ángulo.
+2. ESTRUCTURA VARIADA: NO puedes usar el mismo molde de enunciado más de UNA vez en el lote. Alterna estos formatos:
+   • Pregunta directa abierta: "¿Qué órgano es competente para…?"
+   • Definición inversa: "Se denomina X a aquella actuación que…"
+   • Atribución funcional: "Corresponde a…"
+   • Plazo / requisito: "El plazo para… es de…"
+   • Completar una afirmación: "La normativa establece que…"
+   • Identificar la excepción (si polaridad lo permite): "Es correcto SALVO…"
+   • Caso/supuesto cuando proceda
+   • Requisitos acumulativos / clasificación
+   PROHIBIDO repetir cualquier patrón tipo "¿Cuál es el objetivo de…?", "¿Qué establece el artículo…?", "¿Qué es la…?" más de una vez.
+3. RESPUESTA CORRECTA DISTRIBUIDA: la letra correcta debe variar entre ${letters.join(', ')} a lo largo del lote (no concentres respuestas en una sola letra).
+4. OPCIONES INTELIGENTES: las ${numOpts} opciones deben tener longitud similar, ser todas plausibles, sin pistas léxicas y sin "todas las anteriores" / "ninguna de las anteriores".
+5. NO REPETIR OPCIONES: dentro de una misma pregunta, las opciones deben ser claramente diferenciables. A lo largo del lote, no copies exactamente la misma opción/respuesta correcta de una pregunta a otra.
 
 REGLAS ESTRICTAS DE REDACCIÓN (OBLIGATORIAS):
 - PROHIBIDO usar expresiones metareferentes a la fuente. No escribas NUNCA frases como: "según lo estudiado", "según el texto", "según el documento", "de acuerdo con lo leído", "como se indica en el texto", "según se ha visto", "el autor afirma", "en el temario", "conforme al material", "de lo expuesto", "como se menciona", "en la lectura", "según lo anterior".
@@ -614,7 +741,7 @@ REGLAS ESTRICTAS DE REDACCIÓN (OBLIGATORIAS):
 - No numeres las preguntas (ni "1.", ni "Pregunta 1:").
 - No incluyas explicación, comentario o rationale. Solo enunciado, opciones y ANSWER.
 ${extra ? 'INSTRUCCIONES ADICIONALES: ' + extra : ''}
-
+${antiRep}
 FORMATO AIKEN ESTRICTO (respeta saltos de línea exactos):
 Enunciado de la pregunta terminado en interrogación o afirmación clara
 ${letters.map((l,i)=>`${l}. Opción ${i+1}`).join('\n')}
@@ -622,6 +749,24 @@ ANSWER: ${letters[0]}
 
 Separa cada pregunta del siguiente bloque con una línea en blanco.
 GENERA LAS ${nQ} PREGUNTAS:`;
+}
+
+// Extrae los enunciados (parte previa a las opciones A/B/C/D/E y a ANSWER) de un texto Aiken
+function extractAikenStems(aikenText) {
+  if (!aikenText) return [];
+  const blocks = aikenText.split(/\n\s*\n+/);
+  const stems = [];
+  for (const block of blocks) {
+    const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+    const qLines = [];
+    for (const line of lines) {
+      if (/^[A-E]\.\s/.test(line) || /^ANSWER\s*:/.test(line)) break;
+      qLines.push(line);
+    }
+    const stem = qLines.join(' ').trim();
+    if (stem.length > 8) stems.push(stem);
+  }
+  return stems;
 }
 
 // ── POST /api/upload ──────────────────────────────────────────────────────────
@@ -711,13 +856,26 @@ app.post('/api/generate', async (req, res) => {
   }
   function getDiffs(total) {
     if (config.diffMode === 'single') return [{ d: config.diffSingle, q: total }];
-    const b=+config.diffBajo||0, m=+config.diffMedio||0, a=+config.diffAlto||0;
+    const b = +config.diffBajo || 0, m = +config.diffMedio || 0, a = +config.diffAlto || 0;
     const t = b + m + a || 100;
-    const out = []; let rem = total;
-    if (b>0) { const q = Math.round(total*b/t); if(q){ out.push({d:'bajo',q}); rem-=q; } }
-    if (m>0) { const q = Math.round(total*m/t); if(q){ out.push({d:'medio',q}); rem-=q; } }
-    if (a>0 && rem>0) out.push({d:'alto',q:rem});
-    return out.filter(x => x.q>0);
+    // Distribución proporcional con la última activa absorbiendo cualquier remanente
+    // de redondeo, garantizando que la suma sea EXACTAMENTE total.
+    const allocs = [
+      { d:'bajo',  pct:b },
+      { d:'medio', pct:m },
+      { d:'alto',  pct:a }
+    ].filter(x => x.pct > 0);
+    if (!allocs.length) return [{ d: 'medio', q: total }];
+    const out = [];
+    let rem = total;
+    for (let i = 0; i < allocs.length; i++) {
+      const isLast = i === allocs.length - 1;
+      let q = isLast ? rem : Math.min(rem, Math.round(total * allocs[i].pct / t));
+      if (q < 0) q = 0;
+      if (q > 0) out.push({ d: allocs[i].d, q });
+      rem -= q;
+    }
+    return out.filter(x => x.q > 0);
   }
   function getTypes(total) {
     if (config.typeMode !== 'mix') return [{ t: config.typeMode, n: total }];
@@ -763,6 +921,7 @@ app.post('/api/generate', async (req, res) => {
       const topicQ = getQ(ti);
       send({ type:'topic_start', ti, name:topic.name, questions:topicQ });
       const parts = [];
+      const previousStems = []; // Anti-repetición: enunciados ya generados para este tema
 
       for (const {t, n:typeN} of getTypes(topicQ)) {
         for (const {d, q:diffQ} of getDiffs(typeN)) {
@@ -778,11 +937,14 @@ app.post('/api/generate', async (req, res) => {
               });
               const text = await callClaude(
                 makeMessages(
-                  buildQuestionsPrompt(topic, bQ, t, d, config.minW, config.maxW, config.numOpts, p, config.extraCtx || ''),
+                  buildQuestionsPrompt(topic, bQ, t, d, config.minW, config.maxW, config.numOpts, p, config.extraCtx || '', previousStems),
                   topic
                 )
               );
               parts.push(text);
+              // Acumula los enunciados del lote para evitar repeticiones en lotes siguientes
+              const newStems = extractAikenStems(text);
+              if (newStems.length) previousStems.push(...newStems);
               emitted += bQ;
             }
           }
@@ -976,9 +1138,82 @@ app.post('/api/maqueta', async (req, res) => {
   }
 });
 
+// ── POST /api/maqueta-quiz — genera autoevaluación integrada en JSON ─────────
+app.post('/api/maqueta-quiz', async (req, res) => {
+  const { topicId, type, num, diff } = req.body;
+  const topic = topicCache.get(topicId);
+  if (!topic) return res.status(404).json({ error:'Tema no encontrado.' });
+  const cleanType = ['vf','3opt','4opt'].includes(type) ? type : '4opt';
+  const cleanDiff = ['bajo','medio','alto'].includes(diff) ? diff : 'medio';
+  const cleanNum  = Math.max(3, Math.min(30, parseInt(num) || 10));
+
+  const numOpts = cleanType === 'vf' ? 2 : cleanType === '3opt' ? 3 : 4;
+  const letters = LETTERS.slice(0, numOpts);
+  const dM = {
+    bajo:  'BAJA — definiciones, conceptos directos del contenido.',
+    medio: 'MEDIA — comprensión, aplicación, distinciones entre ideas próximas.',
+    alto:  'ALTA — análisis, síntesis, supuestos complejos. Todas las opciones plausibles.'
+  };
+
+  let prompt;
+  if (cleanType === 'vf') {
+    prompt = `Genera EXACTAMENTE ${cleanNum} preguntas de tipo VERDADERO / FALSO en ESPAÑOL, basadas EXCLUSIVAMENTE en el contenido proporcionado.
+Estilo de oposición real. Dificultad: ${dM[cleanDiff]}.
+
+REGLAS:
+- Cada pregunta es UNA AFIRMACIÓN clara. El alumno debe juzgar si es verdadera o falsa.
+- Distribución equilibrada: aproximadamente la mitad verdaderas y la mitad falsas.
+- Cada afirmación debe ser ÚNICA en concepto y formulación. PROHIBIDO repetir estructuras o enfocar el mismo concepto desde otro ángulo.
+- No uses metarreferencias ("según el texto", "el documento dice...", etc.).
+- Evita ambigüedades: una afirmación es claramente V o claramente F.
+- No incluyas explicaciones largas; sí una breve justificación de una sola línea.
+
+Devuelve ÚNICAMENTE JSON válido (sin texto antes ni después, sin \`\`\`json):
+{"questions":[{"q":"Afirmación a juzgar.","correct":true,"explanation":"Justificación breve."}]}
+"correct" es un booleano (true=verdadero, false=falso).`;
+  } else {
+    prompt = `Genera EXACTAMENTE ${cleanNum} preguntas tipo test de ${numOpts} opciones (${letters.join(', ')}) en ESPAÑOL, basadas EXCLUSIVAMENTE en el contenido proporcionado.
+Estilo de oposición real. SOLO UNA opción correcta por pregunta. Dificultad: ${dM[cleanDiff]}.
+
+REGLAS DE CALIDAD:
+- Cada pregunta debe ser ÚNICA en concepto, enfoque y estructura. PROHIBIDO repetir el mismo molde de enunciado más de una vez (no abuses de "¿Cuál es el objetivo de…?", "¿Qué establece…?", etc.).
+- Las ${numOpts} opciones deben ser todas plausibles, de longitud similar, sin pistas léxicas.
+- No uses "todas las anteriores" ni "ninguna de las anteriores".
+- Distribuye la respuesta correcta entre las distintas letras (no concentres todas en A).
+- No uses metarreferencias ("según el texto", "el documento dice...", etc.); pregunta directamente.
+- Justificación breve de la respuesta correcta (una línea).
+
+Devuelve ÚNICAMENTE JSON válido (sin texto antes ni después, sin \`\`\`json):
+{"questions":[{"q":"Enunciado","options":[${letters.map((_,i)=>`"Opción ${i+1}"`).join(',')}],"correct":0,"explanation":"Breve justificación."}]}
+"correct" es el ÍNDICE 0..${numOpts-1} de la opción correcta.`;
+  }
+
+  try {
+    const raw = await callClaude(makeMessages(prompt, topic), 8000);
+    let s = raw.replace(/```json|```/g,'').trim();
+    const si = s.indexOf('{'), ei = s.lastIndexOf('}') + 1;
+    if (si >= 0 && ei > si) s = s.substring(si, ei);
+    const data = JSON.parse(s);
+    if (!Array.isArray(data.questions)) throw new Error('Respuesta sin questions[].');
+    // Saneamiento
+    const questions = data.questions.slice(0, cleanNum).map(q => {
+      if (cleanType === 'vf') {
+        return { q: String(q.q || '').trim(), correct: !!q.correct, explanation: String(q.explanation || '').trim() };
+      }
+      const opts = Array.isArray(q.options) ? q.options.slice(0, numOpts).map(o => String(o).trim()) : [];
+      let c = parseInt(q.correct);
+      if (isNaN(c) || c < 0 || c >= opts.length) c = 0;
+      return { q: String(q.q || '').trim(), options: opts, correct: c, explanation: String(q.explanation || '').trim() };
+    }).filter(q => q.q.length > 5 && (cleanType === 'vf' || (q.options && q.options.length === numOpts)));
+    res.json({ success:true, type:cleanType, diff:cleanDiff, questions });
+  } catch(err) {
+    res.status(500).json({ error:'No se pudo generar la autoevaluación: ' + err.message });
+  }
+});
+
 // ── POST /api/maqueta-docx — genera Word con plantilla de color ──────────────
 app.post('/api/maqueta-docx', async (req, res) => {
-  const { data, topicId, templateId, colors } = req.body;
+  const { data, topicId, templateId, colors, quiz } = req.body;
   if (!data || !Array.isArray(data.blocks)) return res.status(400).json({ error:'Sin datos.' });
   try {
     const imageStore = topicId ? topicCache.get(topicId)?.images : null;
@@ -993,7 +1228,16 @@ app.post('/api/maqueta-docx', async (req, res) => {
       if (t) finalColors = t.colors;
     }
 
-    const doc = buildMaquetadoDoc(data, imageStore, finalColors);
+    // Saneamiento del quiz si viene en el body
+    let cleanQuiz = null;
+    if (quiz && Array.isArray(quiz.questions) && quiz.questions.length) {
+      cleanQuiz = {
+        type: ['vf','3opt','4opt'].includes(quiz.type) ? quiz.type : '4opt',
+        questions: quiz.questions
+      };
+    }
+
+    const doc = buildMaquetadoDoc(data, imageStore, finalColors, cleanQuiz);
     const buf = await Packer.toBuffer(doc);
     const safe = (data.title || 'documento')
       .replace(/[^\w\-áéíóúüñÁÉÍÓÚÜÑ ]/g,'_')
@@ -1226,7 +1470,7 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 // ── Arranque ──────────────────────────────────────────────────────────────────
 initUsers().then(() => {
   app.listen(PORT, HOST, () => {
-    console.log(`\n✅  Suite Académica Moodle · v7.0`);
+    console.log(`\n✅  Suite Académica Moodle · v8.0`);
     console.log(`   URL    : http://${HOST==='0.0.0.0'?'localhost':HOST}:${PORT}`);
     console.log(`   Modelo : ${MODEL}`);
     console.log(`   Usuarios: ${loadUsers().length} registrados`);
