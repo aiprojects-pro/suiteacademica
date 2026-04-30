@@ -1,4 +1,4 @@
-# Suite Académica para Moodle · v8.0
+# Suite Académica para Moodle · v8.1
 
 Aplicación web para generar preguntas tipo test, resúmenes, mapas conceptuales y documentos maquetados para virtualización a partir de archivos Word y PDF.
 
@@ -10,11 +10,19 @@ Aplicación web para generar preguntas tipo test, resúmenes, mapas conceptuales
 - Penalización configurable en exportación GIFT.
 - Resúmenes en `.txt` y `.docx`.
 - Mapas conceptuales exportables en SVG, PNG y PDF.
-- Maquetación SCORMXPRESS en Word `.docx`.
+- Maquetación SCORMXPRESS en Word `.docx` con:
+  - Maquetado de **varios documentos a la vez** con descarga individual o en ZIP.
+  - Procesamiento **paralelo** de secciones (configurable con `MAQ_CONCURRENCY`).
+  - Numeración secuencial autocorregida en todo el documento.
+  - Punto final automático en títulos, subtítulos y párrafos.
+  - Detección y renderizado de **tablas** (imagen + cuadro de comentario).
+  - Texto de transición automático entre títulos consecutivos.
+  - Preservación literal de términos jurídicos (artículo, art., Título, Sección, Disposición, Real Decreto, etc.).
+  - **Preguntas de control** opcionales: V/F · 3 opciones · 4 opciones · al final o distribuidas en el texto.
+  - Pie de página con sólo número de página.
 - Plantillas de color para maquetación.
 - Historial por usuario.
 - Integración con Moodle por webservice/token.
-- Procesamiento por secciones para PDFs grandes en maquetación.
 
 ## Requisitos
 

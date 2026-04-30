@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Suite Académica · Moodle v8.0</title>
+<title>Suite Académica · Moodle v8.1</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -47,6 +47,7 @@ button{cursor:pointer;font-family:inherit}input,select,textarea{font-family:inhe
 .fname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
 .fmeta{font-size:11px;color:var(--txt3);white-space:nowrap}
 .fimg-badge{font-size:10px;padding:1px 4px;background:var(--ambl);color:var(--amb);border-radius:3px;white-space:nowrap;flex-shrink:0}
+.ftbl-badge{font-size:10px;padding:1px 4px;background:var(--bl);color:var(--b);border-radius:3px;white-space:nowrap;flex-shrink:0}
 .flarge-badge{font-size:10px;padding:1px 4px;background:var(--pl);color:var(--p);border-radius:3px;white-space:nowrap;flex-shrink:0;font-weight:600}
 .fx{background:none;border:none;color:var(--txt3);font-size:17px;line-height:1;padding:0 2px}
 .fx:hover{color:var(--r)}
@@ -244,7 +245,7 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
 <header class="topbar">
   <div class="brand"><h1>Suite Académica para Moodle</h1><p>Preguntas test · Resúmenes · Mapas · Maquetación · Historial · Plantillas de color</p></div>
   <div style="display:flex;align-items:center;gap:10px">
-    <span class="badge">v8.0</span>
+    <span class="badge">v8.1</span>
     <button class="user-btn" id="userBtn" onclick="openPanel()">
       <span class="user-dot"></span>
       <span id="userBtnLabel">Cargando...</span>
@@ -377,13 +378,20 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
   <div id="sb-ma" style="display:none">
     <div class="card">
       <div class="card-title">Maquetación SCORMXPRESS</div>
-      <div class="field"><div class="flbl">Documento a maquetar</div><div class="tsel" id="maqSel"></div></div>
-      <div style="font-size:11px;color:var(--txt3);line-height:1.5">Se detecta la estructura automáticamente. PDFs grandes se procesan por <strong>secciones</strong> con progreso en tiempo real.</div>
+      <div class="field">
+        <div class="flbl">Documentos a maquetar <span id="maqSelCount" style="color:var(--txt3)"></span></div>
+        <div class="tsel" id="maqSel"></div>
+        <div style="display:flex;gap:5px;margin-top:4px">
+          <button class="btn-sm" onclick="selAll('maq',true)">Todos</button>
+          <button class="btn-sm" onclick="selAll('maq',false)">Ninguno</button>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--txt3);line-height:1.5">Puedes seleccionar uno o varios documentos. Cada uno se procesará y se podrá descargar individualmente o en un ZIP. Documentos grandes se trocean automáticamente y se procesan en paralelo.</div>
     </div>
     <div class="card">
       <div class="card-title">Autoevaluación integrada</div>
       <div class="field">
-        <div class="flbl">Incluir preguntas al final</div>
+        <div class="flbl">Incluir preguntas de control</div>
         <div class="seg" id="segMaqQ">
           <button class="on" onclick="setMaqQuiz(false)">No</button>
           <button onclick="setMaqQuiz(true)">Sí</button>
@@ -414,7 +422,14 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
             <button onclick="setCfg('maqQuizDiff','alto');actSeg('segMaqQDiff',2)">Alta</button>
           </div>
         </div>
-        <div style="font-size:11px;color:var(--amb);background:var(--ambl);border-radius:var(--rad-s);padding:.5rem .75rem;line-height:1.5;margin-top:.375rem">Las preguntas y las soluciones se generarán al final del Word maquetado, en una página independiente cada bloque.</div>
+        <div class="field">
+          <div class="flbl">Distribución</div>
+          <div class="seg" id="segMaqQDist">
+            <button class="on" onclick="setCfg('maqQuizDist','end');actSeg('segMaqQDist',0)">Al final del texto</button>
+            <button onclick="setCfg('maqQuizDist','inline');actSeg('segMaqQDist',1)">Distribuidas en el texto</button>
+          </div>
+          <div id="maqQDistHint" style="font-size:11px;color:var(--txt3);margin-top:3px">Las preguntas y soluciones aparecerán al final del Word, en página propia.</div>
+        </div>
       </div>
     </div>
     <div class="card">
@@ -546,40 +561,37 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
     <div id="m-err" class="alert-err" style="display:none"></div>
   </div>
 
-  <!-- Panel MA (Maquetación SSE con chunking) -->
+  <!-- Panel MA (Maquetación SSE con chunking + multi-documento) -->
   <div id="panel-ma" style="display:none">
-    <div id="ma-empty" class="card empty"><div class="empty-ico">✨</div><div class="empty-tit">Sube un documento sin formato</div><div class="empty-sub">PDFs grandes se procesan por secciones automáticamente</div></div>
+    <div id="ma-empty" class="card empty"><div class="empty-ico">✨</div><div class="empty-tit">Sube uno o varios documentos sin formato</div><div class="empty-sub">PDFs y Word grandes se trocean automáticamente y se procesan en paralelo</div></div>
     <div id="ma-actions" style="display:none" class="card">
-      <div class="card-title">Documento seleccionado</div>
+      <div class="card-title">Documentos seleccionados</div>
       <div id="maSelectedInfo" style="font-size:13px;color:var(--txt2);margin-bottom:.875rem"></div>
-      <button class="btn-maq" id="btnMaq" onclick="genMaqueta()">✨ Analizar y maquetar según SCORMXPRESS</button>
-      <div style="font-size:11px;color:var(--txt3);margin-top:.5rem;text-align:center">Documentos grandes (>18K caracteres) se procesan por secciones. Puede tardar varios minutos.</div>
+      <button class="btn-maq" id="btnMaq" onclick="genMaqueta()">✨ Maquetar según SCORMXPRESS</button>
+      <div style="font-size:11px;color:var(--txt3);margin-top:.5rem;text-align:center">Cada documento se procesa por separado (con paralelismo interno) y se descarga individualmente o en un ZIP.</div>
     </div>
     <div id="ma-progress" style="display:none" class="card">
-      <div class="card-title" style="color:var(--amb)">Analizando y estructurando</div>
+      <div class="card-title" style="color:var(--amb)">Maquetando documentos</div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
         <span style="font-size:12px;color:var(--txt2)" id="maProgLbl">Iniciando...</span>
         <span style="font-size:14px;font-weight:600;color:var(--amb)" id="maProgPct">0%</span>
       </div>
       <div class="prog-bg"><div class="prog-fill-amb" id="maProgBar" style="width:0%"></div></div>
-      <div id="maChunkInfo" style="font-size:11px;color:var(--txt3);margin-top:.5rem"></div>
+      <div id="maTopicList" style="display:flex;flex-direction:column;gap:3px;max-height:240px;overflow-y:auto;margin-top:.625rem"></div>
     </div>
     <div id="ma-results" style="display:none" class="card">
-      <div class="card-title" style="color:var(--amb)">Documento maquetado ✓</div>
-      <div id="maTruncWarn" style="display:none" class="trunc-warn">⚠ El documento era muy extenso para procesarlo completo. Se maquetó la primera parte. Para documentos muy largos, divide en secciones.</div>
-      <div id="maChunkOk" style="display:none" class="info-ok"></div>
+      <div class="card-title" style="color:var(--amb)">Documentos maquetados ✓</div>
       <div id="maQuizBanner" style="display:none" class="info-warn"></div>
-      <div class="maq-stat" id="maStats"></div>
-      <div style="font-size:12px;font-weight:500;color:var(--txt2);margin-bottom:.5rem">Estructura detectada (títulos):</div>
-      <div class="maq-outline" id="maOutline"></div>
+      <div id="maBatchSummary" style="font-size:13px;color:var(--txt2);margin-bottom:.625rem"></div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:.5rem">
         <span style="font-size:11px;color:var(--txt2)">Plantilla activa:</span>
         <span id="maActiveTpl" style="font-size:11px;font-weight:600;color:var(--amb)"></span>
         <div id="maTplChips" style="display:flex;gap:3px"></div>
       </div>
-      <button class="btn-maq" onclick="dlMaquetaDocx()" style="margin-bottom:.75rem">⬇ Descargar Word maquetado (.docx)</button>
-      <div class="info-warn"><strong>Revisa el documento descargado:</strong> Todos los párrafos y elementos de lista terminan en punto (optimizado para locución con IA). Las imágenes de DOCX se insertan centradas. Para PDFs, añade las imágenes manualmente.</div>
-      <div style="margin-top:.75rem"><button class="btn-sm" onclick="resetMaqueta()">↺ Maquetar otro documento</button></div>
+      <div id="maResultsList" style="display:flex;flex-direction:column;gap:.625rem;margin-bottom:.875rem"></div>
+      <button class="btn-maq" id="maDlAllZip" onclick="dlMaquetaZip()" style="display:none;margin-bottom:.75rem">⬇ Descargar todos en ZIP</button>
+      <div class="info-warn"><strong>Revisa los documentos descargados:</strong> Todos los títulos, subtítulos y párrafos terminan en punto (optimizado para locución con IA). Numeración renormalizada de forma secuencial. Imágenes y tablas centradas. Para PDFs sin imágenes embebidas, añádelas manualmente.</div>
+      <div style="margin-top:.75rem"><button class="btn-sm" onclick="resetMaqueta()">↺ Maquetar otros documentos</button></div>
     </div>
     <div id="ma-err" class="alert-err" style="display:none"></div>
   </div>
@@ -597,7 +609,7 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
 <script>
 const $ = id => document.getElementById(id);
 let topics=[], qResults=[], mapSVG='', mapW=0, mapH=0, busy=false, qActiveTab=0;
-let maqData=null, maqTopicId=null, maqQuiz=null;
+let maqResults=[];
 let currentUser=null;
 let historyItems=[], histFilter='';
 let templates=[], activeTplId='default-scormxpress', customColors=null;
@@ -613,7 +625,7 @@ const cfg = {
   expMode:'unico', penalty:'none',
   pages:3, mapDepth:'completo',
   // Maquetación → autoevaluación integrada
-  maqQuizEnabled:false, maqQuizType:'3opt', maqQuizNum:10, maqQuizDiff:'medio'
+  maqQuizEnabled:false, maqQuizType:'3opt', maqQuizNum:10, maqQuizDiff:'medio', maqQuizDist:'end'
 };
 const MAP_COLORS=[{bg:'#e1f5ee',s:'#085041',t:'#04342C'},{bg:'#e6f1fb',s:'#185FA5',t:'#042C53'},{bg:'#faece7',s:'#993C1D',t:'#4A1B0C'},{bg:'#EEEDFE',s:'#534AB7',t:'#26215C'},{bg:'#faeeda',s:'#854F0B',t:'#412402'},{bg:'#EAF3DE',s:'#3B6D11',t:'#173404'},{bg:'#FBEAF0',s:'#993556',t:'#4B1528'}];
 
@@ -675,20 +687,35 @@ function refreshUI(tab){
     renderTopicSel('maqSel','maq');
     const sel=getSelected('maq');
     $('ma-actions').style.display=has&&sel.length?'block':'none';
+    const cnt=$('maqSelCount');if(cnt)cnt.textContent=sel.length?`(${sel.length})`:'';
     if(has&&sel.length){
-      const tp=topics.find(t=>t.id===sel[0]);
-      if(tp){
-        const imgNote=tp.imageCount>0?` · ${tp.imageCount} imagen${tp.imageCount!==1?'es':''}`:'';
-        const largeNote=tp.largeDoc?' · <span style="color:var(--p);font-weight:600">documento grande — procesamiento por secciones</span>':'';
-        const pgNote=tp.pages?` · ${tp.pages} págs`:'';
-        $('maSelectedInfo').innerHTML=`📄 <strong>${esc(tp.name.replace(/\.[^.]+$/,''))}</strong> · ${tp.type.toUpperCase()}${pgNote}${tp.words?' · '+tp.words.toLocaleString()+' palabras':''}${imgNote}${largeNote}`;
+      if(sel.length===1){
+        const tp=topics.find(t=>t.id===sel[0]);
+        if(tp){
+          const imgNote=tp.imageCount>0?` · ${tp.imageCount} imagen${tp.imageCount!==1?'es':''}`:'';
+          const tblNote=tp.tableCount>0?` · ${tp.tableCount} tabla${tp.tableCount!==1?'s':''}`:'';
+          const largeNote=tp.largeDoc?' · <span style="color:var(--p);font-weight:600">documento grande — procesamiento por secciones</span>':'';
+          const pgNote=tp.pages?` · ${tp.pages} págs`:'';
+          $('maSelectedInfo').innerHTML=`📄 <strong>${esc(tp.name.replace(/\.[^.]+$/,''))}</strong> · ${tp.type.toUpperCase()}${pgNote}${tp.words?' · '+tp.words.toLocaleString()+' palabras':''}${imgNote}${tblNote}${largeNote}`;
+        }
+        $('btnMaq').textContent='✨ Maquetar según SCORMXPRESS';
+      } else {
+        const selTopics=sel.map(id=>topics.find(t=>t.id===id)).filter(Boolean);
+        const totalImg=selTopics.reduce((s,t)=>s+(t.imageCount||0),0);
+        const totalTbl=selTopics.reduce((s,t)=>s+(t.tableCount||0),0);
+        const anyLarge=selTopics.some(t=>t.largeDoc);
+        $('maSelectedInfo').innerHTML=`📄 <strong>${sel.length} documentos seleccionados</strong>${totalImg?` · ${totalImg} imágenes`:''}${totalTbl?` · ${totalTbl} tablas`:''}${anyLarge?' · <span style="color:var(--p);font-weight:600">incluye docs grandes</span>':''}`;
+        $('btnMaq').textContent=`✨ Maquetar ${sel.length} documentos`;
       }
     }
-    // Hint para tipo de pregunta integrada
+    // Hints
     const qth={vf:'Verdadero / Falso · una afirmación por pregunta',
                '3opt':'Una sola respuesta correcta · A, B, C',
                '4opt':'Una sola respuesta correcta · A, B, C, D'};
     const qte=$('maqQTypeHint');if(qte)qte.textContent=qth[cfg.maqQuizType]||'';
+    const qdh={end:'Las preguntas y soluciones aparecerán al final del Word, en página propia.',
+               inline:'Las preguntas se distribuirán a lo largo del texto en cuadros destacados.'};
+    const qdhe=$('maqQDistHint');if(qdhe)qdhe.textContent=qdh[cfg.maqQuizDist]||qdh.end;
     renderTplChips();
   }
 }
@@ -706,17 +733,28 @@ function renderTopics(){
 function renderTopicSel(elId,mode){
   const el=$(elId);if(!el)return;
   if(!topics.length){el.innerHTML='<div style="font-size:12px;color:var(--txt3);padding:.5rem">Sin documentos</div>';return;}
-  const multi=mode==='sum';
+  const multi = mode==='sum' || mode==='maq';
+  const cls = mode==='sum' ? 'sch' : (mode==='maq' ? 'mch' : '');
   el.innerHTML=topics.map((t,i)=>{
     const big=t.largeDoc?' <span class="flarge-badge">LARGO</span>':'';
-    return `<label class="tsel-item"><input type="${multi?'checkbox':'radio'}" ${multi?'class="sch"':`name="${mode}topic"`} data-id="${t.id}" ${i===0?'checked':''}><span class="tsel-name" title="${esc(t.name)}">${esc(t.name.replace(/\.[^.]+$/,''))}</span><span class="tsel-tag ${t.type}">${t.type.toUpperCase()}</span>${t.imageCount?`<span class="fimg-badge" style="margin-left:2px">📷${t.imageCount}</span>`:''}${big}</label>`;
+    const tblBadge = t.tableCount?`<span class="ftbl-badge" style="margin-left:2px">▦${t.tableCount}</span>`:'';
+    return `<label class="tsel-item"><input type="${multi?'checkbox':'radio'}" ${multi?`class="${cls}"`:`name="${mode}topic"`} data-id="${t.id}" ${i===0?'checked':''}><span class="tsel-name" title="${esc(t.name)}">${esc(t.name.replace(/\.[^.]+$/,''))}</span><span class="tsel-tag ${t.type}">${t.type.toUpperCase()}</span>${t.imageCount?`<span class="fimg-badge" style="margin-left:2px">📷${t.imageCount}</span>`:''}${tblBadge}${big}</label>`;
   }).join('');
   el.querySelectorAll('input').forEach(inp=>inp.addEventListener('change',()=>refreshUI()));
 }
 
-function getSelected(mode){if(mode==='sum')return Array.from(document.querySelectorAll('.sch:checked')).map(c=>c.dataset.id);const r=document.querySelector(`input[name="${mode}topic"]:checked`);return r?[r.dataset.id]:topics.length?[topics[0].id]:[];}
-function selAll(mode,val){document.querySelectorAll('.sch').forEach(c=>c.checked=val);refreshUI('s');}
-function clearAll(){topics=[];qResults=[];maqData=null;maqTopicId=null;renderTopics();refreshUI();['q','s','m','ma'].forEach(t=>{if($(`${t}-results`))$(`${t}-results`).style.display='none';});}
+function getSelected(mode){
+  if(mode==='sum')return Array.from(document.querySelectorAll('.sch:checked')).map(c=>c.dataset.id);
+  if(mode==='maq')return Array.from(document.querySelectorAll('.mch:checked')).map(c=>c.dataset.id);
+  const r=document.querySelector(`input[name="${mode}topic"]:checked`);
+  return r?[r.dataset.id]:topics.length?[topics[0].id]:[];
+}
+function selAll(mode,val){
+  const cls = mode==='sum' ? '.sch' : '.mch';
+  document.querySelectorAll(cls).forEach(c=>c.checked=val);
+  refreshUI(mode==='sum'?'s':'ma');
+}
+function clearAll(){topics=[];qResults=[];maqResults=[];renderTopics();refreshUI();['q','s','m','ma'].forEach(t=>{if($(`${t}-results`))$(`${t}-results`).style.display='none';});}
 
 const dz=$('dz'),fi=$('fi');
 dz.onclick=()=>fi.click();
@@ -857,7 +895,7 @@ function aikenToGift(aikenText,penalty){
   const pm={none:null,third:-33.33333,half:-50,full:-100};const pp=pm[penalty];
   function escG(s){return s.replace(/([~={#}:])/g,'\\$1');}
   const lines=aikenText.split('\n');
-  let out='// GIFT — Suite Académica Moodle v8.0\n// Penalización: '+penalty+'\n\n';
+  let out='// GIFT — Suite Académica Moodle v8.1\n// Penalización: '+penalty+'\n\n';
   let i=0,qn=0;
   while(i<lines.length){
     const line=lines[i].trim();
@@ -1039,98 +1077,184 @@ async function dlMapPng(){if(!mapSVG)return;const png=await svgToPng();const a=d
 async function dlMapPdf(){if(!mapSVG)return;const png=await svgToPng();const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';s.onload=()=>{const{jsPDF}=window.jspdf;const orient=mapW>mapH?'landscape':'portrait';const pdf=new jsPDF({orientation:orient,unit:'px',format:[mapW,mapH]});pdf.addImage(png,'PNG',0,0,mapW,mapH);pdf.save('mapa_conceptual.pdf');};document.head.appendChild(s);}
 function dlMapSvg(){if(!mapSVG)return;dlTxt(mapSVG,'mapa_conceptual.svg');}
 
-// ── Maquetación (SSE con chunking) ────────────────────────────────────────────
+// ── Maquetación (multi-documento + SSE con chunking paralelo) ────────────────
 async function genMaqueta(){
   const selIds=getSelected('maq');if(!selIds.length||busy)return;
-  busy=true;maqData=null;maqTopicId=selIds[0];maqQuiz=null;
+  busy=true;
+  maqResults=[]; // [{topicId, name, data, stats, hasImages, hasTables, quiz}]
   showPanel('ma','progress');
   $('maProgBar').style.width='0%';$('maProgPct').textContent='0%';
-  $('maProgLbl').textContent='Iniciando...';$('maChunkInfo').textContent='';
+  $('maProgLbl').textContent='Iniciando...';
+  // Lista de progreso por documento
+  const list=$('maTopicList');list.innerHTML='';
+  const tEls={};
+  selIds.forEach(id=>{
+    const tp=topics.find(t=>t.id===id);if(!tp)return;
+    const div=document.createElement('div');
+    div.className='tp wait';div.id=`mt-${id}`;
+    div.innerHTML=`<span class="tp-ico">○</span><span class="tp-name">${esc(tp.name.replace(/\.[^.]+$/,''))}</span><span class="tp-n">en cola</span>`;
+    list.appendChild(div);tEls[id]=div;
+  });
 
   try{
-    await readSSE('/api/maqueta',{topicId:selIds[0]},ev=>{
-      if(ev.type==='start'){
-        if(ev.mode==='chunked'){
-          $('maChunkInfo').textContent=`📄 Documento grande · ${ev.totalChunks} secciones · ${(ev.textLength||0).toLocaleString()} caracteres${ev.pages?' · '+ev.pages+' páginas':''}`;
-        }else{
-          $('maChunkInfo').textContent='Procesando en una sola pasada...';
-        }
+    await readSSE('/api/maqueta-batch',{topicIds:selIds},async ev=>{
+      if(ev.type==='batch_start'){
+        $('maProgLbl').textContent=`Maquetando ${ev.total} documento${ev.total!==1?'s':''}...`;
       }
-      if(ev.type==='progress'){
-        $('maProgBar').style.width=ev.pct+'%';
-        $('maProgPct').textContent=ev.pct+'%';
-        $('maProgLbl').textContent=ev.label||'';
+      if(ev.type==='topic_start'){
+        const id=selIds[ev.ti];const el=tEls[id];
+        if(el){el.className='tp act';el.querySelector('.tp-ico').innerHTML='<span class="spin">⟳</span>';el.querySelector('.tp-n').textContent='procesando...';}
+        $('maProgLbl').textContent=`Documento ${ev.ti+1}/${ev.total}: "${ev.name.replace(/\.[^.]+$/,'')}"`;
+        const pct=Math.round((ev.ti/ev.total)*100);
+        $('maProgBar').style.width=pct+'%';$('maProgPct').textContent=pct+'%';
       }
-      if(ev.type==='chunk_error'){
-        $('maChunkInfo').innerHTML+=`<br><span style="color:var(--r)">⚠ Error en sección ${ev.chunk}: ${esc(ev.message)} (continuando)</span>`;
+      if(ev.type==='topic_progress'){
+        const id=selIds[ev.ti];const el=tEls[id];
+        if(el){el.querySelector('.tp-n').textContent=ev.label||'';}
+      }
+      if(ev.type==='topic_complete'){
+        const id=selIds[ev.ti];const el=tEls[id];
+        const st=ev.stats||{};
+        const titles=(st.h1||0)+(st.h2||0)+(st.h3||0);
+        const ic=st.img||0,tc=st.table||0;
+        if(el){el.className='tp done';el.querySelector('.tp-ico').textContent='✓';el.querySelector('.tp-n').textContent=`${titles} tít · ${st.p||0} párr · ${ic} img · ${tc} tablas`;}
+        const tp=topics.find(t=>t.id===id);
+        const result={topicId:id, name:ev.name, data:ev.data, stats:st, hasImages:ev.hasImages, hasTables:ev.hasTables, quiz:null, topicWords:tp?.words};
+        maqResults.push(result);
+        // Si el quiz está activo, generamos en paralelo (no bloquea siguiente doc)
+        if(cfg.maqQuizEnabled){generateMaqQuizFor(result).catch(()=>{});}
+      }
+      if(ev.type==='topic_error'){
+        const id=selIds[ev.ti];const el=tEls[id];
+        if(el){el.className='tp wait';el.querySelector('.tp-ico').textContent='✗';el.querySelector('.tp-n').textContent='error: '+ev.message;el.style.color='var(--r)';}
+      }
+      if(ev.type==='batch_complete'){
+        $('maProgBar').style.width='100%';$('maProgPct').textContent='100%';
+        $('maProgLbl').textContent='Completado.';
+        renderMaResults();
+        showPanel('ma','results');
+        // Historial
+        try{
+          for(const r of maqResults){
+            const tp=topics.find(t=>t.id===r.topicId);
+            const st=r.stats||{};
+            const h1c=st.h1||0,h2c=st.h2||0,h3c=st.h3||0,pc=st.p||0,lc=(st.ul||0)+(st.ol||0),ic=st.img||0,tc=st.table||0;
+            saveToHistory('maqueta',r.data.title||(tp?tp.name.replace(/\.[^.]+$/,''):'Documento'),
+              {titles:h1c+h2c+h3c,paragraphs:pc,lists:lc,images:ic,tables:tc,topicName:tp?.name||null,
+               quiz:cfg.maqQuizEnabled?{type:cfg.maqQuizType,num:cfg.maqQuizNum,diff:cfg.maqQuizDiff,dist:cfg.maqQuizDist}:null},
+              {data:r.data,topicId:r.topicId});
+          }
+        }catch(_){}
       }
       if(ev.type==='error'){showErr('ma','Error: '+ev.message);showPanel('ma','actions');}
-      if(ev.type==='complete'){
-        maqData=ev.data;
-        $('maTruncWarn').style.display=ev.truncated?'block':'none';
-        const chunkOk=$('maChunkOk');
-        if(ev.mode==='chunked'){
-          chunkOk.style.display='block';
-          chunkOk.textContent=`✓ Documento procesado en ${ev.processedChunks} secciones · todas las secciones unificadas en un solo Word`;
-        }else chunkOk.style.display='none';
-        const st=ev.stats||{};
-        const h1c=st.h1||0,h2c=st.h2||0,h3c=st.h3||0,pc=st.p||0,lc=(st.ul||0)+(st.ol||0),ic=st.img||0;
-        $('maStats').innerHTML=`<div class="maq-sc"><div class="n">${h1c+h2c+h3c}</div><div class="l">Títulos</div></div><div class="maq-sc"><div class="n">${pc}</div><div class="l">Párrafos</div></div><div class="maq-sc"><div class="n">${lc}</div><div class="l">Listas</div></div><div class="maq-sc"><div class="n">${ic}</div><div class="l">Imágenes</div></div>`;
-        const outline=$('maOutline');outline.innerHTML='';
-        (maqData.blocks||[]).forEach(b=>{
-          if(!['h1','h2','h3','img'].includes(b.t))return;
-          const div=document.createElement('div');
-          if(b.t==='img'){div.className='maq-img';div.textContent=`📷 Imagen ${typeof b.idx==='number'?b.idx+1:''}`;}
-          else{div.className=`maq-${b.t}`;div.textContent=(b.n?b.n+' ':'')+b.text;}
-          outline.appendChild(div);
-        });
-        if(!outline.children.length)outline.innerHTML='<div style="color:var(--txt3);font-size:12px">Sin títulos detectados. El contenido se estructuró como párrafos.</div>';
-        renderTplChips();
-        showPanel('ma','results');
-        // Generar autoevaluación integrada si está activada
-        if(cfg.maqQuizEnabled){generateMaqQuiz();}
-        else{$('maQuizBanner').style.display='none';}
-        // Historial
-        const tp=topics.find(t=>t.id===maqTopicId);
-        saveToHistory('maqueta',maqData.title||(tp?tp.name.replace(/\.[^.]+$/,''):'Documento'),{titles:h1c+h2c+h3c,paragraphs:pc,lists:lc,images:ic,chunked:ev.mode==='chunked',chunks:ev.processedChunks||null,topicName:tp?.name||null,quiz:cfg.maqQuizEnabled?{type:cfg.maqQuizType,num:cfg.maqQuizNum,diff:cfg.maqQuizDiff}:null},{data:maqData,topicId:maqTopicId});
-      }
     });
   }catch(e){showErr('ma','Error: '+e.message);showPanel('ma','actions');}
   busy=false;
 }
 
-async function generateMaqQuiz(){
-  const banner=$('maQuizBanner');if(!banner)return;
-  banner.style.display='block';
-  banner.innerHTML=`<span class="spin">⟳</span> Generando ${cfg.maqQuizNum} preguntas de autoevaluación (${cfg.maqQuizType==='vf'?'V/F':cfg.maqQuizType==='3opt'?'3 opciones':'4 opciones'} · dificultad ${cfg.maqQuizDiff})...`;
+function renderMaResults(){
+  const banner=$('maQuizBanner');
+  if(cfg.maqQuizEnabled){
+    banner.style.display='block';
+    const tipoLbl=cfg.maqQuizType==='vf'?'V/F':cfg.maqQuizType==='3opt'?'3 opciones':'4 opciones';
+    const distLbl=cfg.maqQuizDist==='inline'?'distribuidas en el texto':'al final del documento';
+    banner.innerHTML=`<span class="spin">⟳</span> Generando autoevaluación (${cfg.maqQuizNum} preguntas · ${tipoLbl} · ${distLbl})...`;
+  } else {
+    banner.style.display='none';
+  }
+  $('maBatchSummary').innerHTML=`<strong>${maqResults.length}</strong> documento${maqResults.length!==1?'s':''} maquetado${maqResults.length!==1?'s':''}. Descarga individualmente o en ZIP.`;
+  const list=$('maResultsList');list.innerHTML='';
+  maqResults.forEach((r,i)=>{
+    const st=r.stats||{};
+    const h1c=st.h1||0,h2c=st.h2||0,h3c=st.h3||0,pc=st.p||0,lc=(st.ul||0)+(st.ol||0),ic=st.img||0,tc=st.table||0;
+    const card=document.createElement('div');
+    card.className='card';card.style.padding='.875rem';card.style.background='var(--sur2)';
+    const safeNm=esc(r.data.title||r.name.replace(/\.[^.]+$/,''));
+    card.innerHTML=`
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.75rem;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:13px;font-weight:600;color:var(--txt);margin-bottom:.25rem">${safeNm}</div>
+          <div style="font-size:11px;color:var(--txt3)">${h1c+h2c+h3c} títulos · ${pc} párrafos · ${lc} listas · ${ic} imágenes · ${tc} tablas</div>
+        </div>
+        <button class="btn-maq" style="width:auto;padding:7px 12px;font-size:12px" data-i="${i}">⬇ Descargar Word</button>
+      </div>
+      <details style="margin-top:.5rem"><summary style="font-size:11px;cursor:pointer;color:var(--txt2)">Ver estructura detectada</summary>
+        <div class="maq-outline" style="margin-top:.375rem">${renderOutline(r.data)}</div>
+      </details>`;
+    card.querySelector('.btn-maq').onclick=()=>dlOneMaqueta(i);
+    list.appendChild(card);
+  });
+  $('maDlAllZip').style.display=maqResults.length>1?'block':'none';
+}
+function renderOutline(data){
+  const lines=[];
+  (data.blocks||[]).forEach(b=>{
+    if(b.t==='h1')lines.push(`<div class="maq-h1">${esc((b.n?b.n+' ':'')+b.text)}</div>`);
+    else if(b.t==='h2')lines.push(`<div class="maq-h2">${esc((b.n?b.n+' ':'')+b.text)}</div>`);
+    else if(b.t==='h3')lines.push(`<div class="maq-h3">${esc((b.n?b.n+' ':'')+b.text)}</div>`);
+    else if(b.t==='img')lines.push(`<div class="maq-img">📷 Imagen ${typeof b.idx==='number'?b.idx+1:''}</div>`);
+    else if(b.t==='table')lines.push(`<div class="maq-img">▦ Tabla ${typeof b.idx==='number'?b.idx+1:''}</div>`);
+  });
+  return lines.length?lines.join(''):'<div style="color:var(--txt3);font-size:12px">Sin títulos detectados.</div>';
+}
+
+async function generateMaqQuizFor(result){
   try{
-    const res=await fetch('/api/maqueta-quiz',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topicId:maqTopicId,type:cfg.maqQuizType,num:cfg.maqQuizNum,diff:cfg.maqQuizDiff})});
+    const res=await fetch('/api/maqueta-quiz',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topicId:result.topicId,type:cfg.maqQuizType,num:cfg.maqQuizNum,diff:cfg.maqQuizDiff})});
     const data=await res.json();
-    if(!res.ok||!data.success)throw new Error(data.error||'Error generando autoevaluación');
-    maqQuiz={type:data.type,questions:data.questions||[]};
-    if(!maqQuiz.questions.length)throw new Error('No se obtuvieron preguntas válidas');
-    const tipoLbl=data.type==='vf'?'Verdadero/Falso':data.type==='3opt'?'3 opciones':'4 opciones';
-    banner.innerHTML=`✓ Autoevaluación generada: <strong>${maqQuiz.questions.length} preguntas</strong> (${tipoLbl} · dif. ${cfg.maqQuizDiff}) · se incluirán al final del Word con sus soluciones.`;
+    if(!res.ok||!data.success)throw new Error(data.error||'Error');
+    if(data.questions?.length){
+      result.quiz={type:data.type, mode:cfg.maqQuizDist, questions:data.questions};
+    }
+    refreshQuizBanner();
   }catch(e){
-    maqQuiz=null;
-    banner.innerHTML=`<span style="color:var(--r)">⚠ No se pudo generar la autoevaluación: ${esc(e.message)}. El Word se generará sin ella.</span>`;
+    refreshQuizBanner('error: '+e.message);
+  }
+}
+function refreshQuizBanner(errMsg){
+  const banner=$('maQuizBanner');if(!banner)return;
+  if(!cfg.maqQuizEnabled){banner.style.display='none';return;}
+  const total=maqResults.length;
+  const ready=maqResults.filter(r=>r.quiz&&r.quiz.questions&&r.quiz.questions.length).length;
+  banner.style.display='block';
+  if(errMsg){
+    banner.innerHTML=`<span style="color:var(--r)">⚠ Error generando alguna autoevaluación: ${esc(errMsg)}. Los demás Words se generarán normalmente.</span>`;
+  } else if(ready===total){
+    const tipoLbl=cfg.maqQuizType==='vf'?'V/F':cfg.maqQuizType==='3opt'?'3 opciones':'4 opciones';
+    const distLbl=cfg.maqQuizDist==='inline'?'distribuidas en el texto':'al final del documento';
+    banner.innerHTML=`✓ Autoevaluación lista en <strong>${ready}/${total}</strong> documentos (${tipoLbl} · dif. ${cfg.maqQuizDiff} · ${distLbl}).`;
+  } else {
+    banner.innerHTML=`<span class="spin">⟳</span> Generando autoevaluaciones... ${ready}/${total} listas.`;
   }
 }
 
-async function dlMaquetaDocx(){
-  if(!maqData)return;
+async function dlOneMaqueta(idx){
+  const r=maqResults[idx];if(!r)return;
   try{
-    const body={data:maqData,topicId:maqTopicId};
+    const body={data:r.data, topicId:r.topicId};
     if(customColors){body.colors=customColors;}
     else if(activeTplId){body.templateId=activeTplId;}
-    if(maqQuiz&&maqQuiz.questions&&maqQuiz.questions.length){body.quiz=maqQuiz;}
+    if(r.quiz&&r.quiz.questions&&r.quiz.questions.length){body.quiz=r.quiz;}
     const res=await fetch('/api/maqueta-docx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!res.ok){const e=await res.json().catch(()=>({error:'Error'}));throw new Error(e.error||'Error');}
     const blob=await res.blob();const u=URL.createObjectURL(blob);
-    const a=document.createElement('a');a.href=u;a.download=`${safeName(maqData.title||'documento')}_maquetado.docx`;a.click();URL.revokeObjectURL(u);
+    const a=document.createElement('a');a.href=u;a.download=`${safeName(r.data.title||r.name||'documento')}_maquetado.docx`;a.click();URL.revokeObjectURL(u);
   }catch(e){showErr('ma','Error: '+e.message);}
 }
-function resetMaqueta(){maqData=null;maqTopicId=null;maqQuiz=null;showPanel('ma','actions');refreshUI('ma');}
+async function dlMaquetaZip(){
+  if(!maqResults.length)return;
+  try{
+    const body={items:maqResults.map(r=>({data:r.data,topicId:r.topicId,quiz:r.quiz||null}))};
+    if(customColors){body.colors=customColors;}
+    else if(activeTplId){body.templateId=activeTplId;}
+    const res=await fetch('/api/maqueta-zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok){const e=await res.json().catch(()=>({error:'Error'}));throw new Error(e.error||'Error');}
+    const blob=await res.blob();const u=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=u;a.download=`maquetados_${maqResults.length}_documentos.zip`;a.click();URL.revokeObjectURL(u);
+  }catch(e){showErr('ma','Error: '+e.message);}
+}
+
+function resetMaqueta(){maqResults=[];showPanel('ma','actions');refreshUI('ma');}
 
 // ── Plantillas de color ───────────────────────────────────────────────────────
 async function loadTemplates(){
@@ -1330,32 +1454,35 @@ async function loadFromHistory(id){
       $('mapWrap').innerHTML=mapSVG;
       setTab('m');showPanel('m','results');
     } else if(entry.type==='maqueta'){
-      maqData=entry.content.data;
-      maqTopicId=entry.content.topicId;
-      // Re-renderizar stats y outline
-      const blocks=maqData.blocks||[];
+      // Cargar como un único resultado en el modelo multi-doc
+      const data=entry.content.data;
+      const topicId=entry.content.topicId;
+      const blocks=data.blocks||[];
       const st=blocks.reduce((s,b)=>{s[b.t]=(s[b.t]||0)+1;return s;},{});
-      const h1c=st.h1||0,h2c=st.h2||0,h3c=st.h3||0,pc=st.p||0,lc=(st.ul||0)+(st.ol||0),ic=st.img||0;
-      $('maStats').innerHTML=`<div class="maq-sc"><div class="n">${h1c+h2c+h3c}</div><div class="l">Títulos</div></div><div class="maq-sc"><div class="n">${pc}</div><div class="l">Párrafos</div></div><div class="maq-sc"><div class="n">${lc}</div><div class="l">Listas</div></div><div class="maq-sc"><div class="n">${ic}</div><div class="l">Imágenes</div></div>`;
-      const outline=$('maOutline');outline.innerHTML='';
-      blocks.forEach(b=>{
-        if(!['h1','h2','h3','img'].includes(b.t))return;
-        const div=document.createElement('div');
-        if(b.t==='img'){div.className='maq-img';div.textContent=`📷 Imagen ${typeof b.idx==='number'?b.idx+1:''}`;}
-        else{div.className=`maq-${b.t}`;div.textContent=(b.n?b.n+' ':'')+b.text;}
-        outline.appendChild(div);
-      });
-      if(!outline.children.length)outline.innerHTML='<div style="color:var(--txt3);font-size:12px">Sin títulos.</div>';
-      $('maChunkOk').style.display=entry.meta?.chunked?'block':'none';
-      if(entry.meta?.chunked)$('maChunkOk').textContent=`✓ Documento cargado desde historial · ${entry.meta.chunks} secciones originales`;
-      $('maTruncWarn').style.display='none';
+      const tp=topics.find(t=>t.id===topicId);
+      const result={
+        topicId,
+        name: data.title || tp?.name || (entry.title||'Documento')+'.docx',
+        data,
+        stats: st,
+        hasImages: !!(st.img),
+        hasTables: !!(st.table),
+        quiz: null,
+        topicWords: tp?.words || 0,
+        fromHistory: true
+      };
+      maqResults=[result];
       renderTplChips();
-      setTab('ma');showPanel('ma','results');
-      // Aviso: si el topic original ya no está en cache, las imágenes no funcionarán
-      if(maqTopicId && !topics.find(t=>t.id===maqTopicId)){
-        $('maChunkOk').innerHTML+='<br><span style="color:var(--amb)">⚠ El documento original ya no está cargado. Las imágenes embebidas no se incluirán. Re-sube el archivo si las necesitas.</span>';
-        $('maChunkOk').style.display='block';
+      renderMaResults();
+      // Aviso si el topic original ya no está en cache
+      const banner=$('maQuizBanner');
+      if(topicId && !topics.find(t=>t.id===topicId)){
+        banner.style.display='block';
+        banner.innerHTML='<span style="color:var(--amb)">⚠ El documento original ya no está cargado en esta sesión. Las imágenes/tablas embebidas no se incluirán al descargar. Vuelve a subir el archivo si las necesitas.</span>';
+      } else {
+        banner.style.display='none';
       }
+      setTab('ma');showPanel('ma','results');
     }
   }catch(e){alert('Error cargando entrada: '+e.message);}
 }

@@ -14,7 +14,8 @@ const fs        = require('fs');
 
 const {
   Document, Packer, Paragraph, TextRun, ImageRun, HeadingLevel,
-  AlignmentType, BorderStyle, Header, Footer, PageNumber, LevelFormat
+  AlignmentType, BorderStyle, Header, Footer, PageNumber, LevelFormat,
+  Table, TableRow, TableCell, WidthType, ShadingType
 } = require('docx');
 
 // ── Validaciones de entorno ───────────────────────────────────────────────────
@@ -313,7 +314,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 });
 
 app.get('/api/health', (_req, res) => res.json({
-  status:'ok', model:MODEL, version:'8.0.0', users:loadUsers().length,
+  status:'ok', model:MODEL, version:'8.1.0', users:loadUsers().length,
   limits: { maqChunk:MAQ_CHUNK, maqSingle:MAQ_SINGLE, historyLimit:HISTORY_LIMIT }
 }));
 
@@ -363,8 +364,41 @@ function getImgDimensions(buf, contentType) {
   }catch(_){}
   return {width:460,height:280};
 }
-function htmlToText(html) {
-  return html
+// Convierte HTML de mammoth a texto plano. Antes de aplanar:
+//  - extrae cada <table>...</table> y la sustituye por un marcador __TABLE_N__,
+//    devolviendo en `tables` la representación literal de la tabla en celdas.
+//  - extrae los <img src="__IMG_N__"> respetando los marcadores ya inyectados.
+function htmlToText(html, tables = []) {
+  // 1. Extraer tablas y sustituir por marcadores
+  const withMarkers = String(html).replace(/<table[\s\S]*?<\/table>/gi, (match) => {
+    const idx = tables.length;
+    // Convertir la tabla a una matriz de celdas de texto
+    const rows = [];
+    const rowRe = /<tr[\s\S]*?<\/tr>/gi;
+    let rm;
+    while ((rm = rowRe.exec(match)) !== null) {
+      const cells = [];
+      const cellRe = /<(t[hd])[^>]*>([\s\S]*?)<\/\1>/gi;
+      let cm;
+      while ((cm = cellRe.exec(rm[0])) !== null) {
+        const cellText = cm[2]
+          .replace(/<br\s*\/?>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+          .replace(/\s+/g, ' ').trim();
+        cells.push(cellText);
+      }
+      if (cells.length) rows.push(cells);
+    }
+    if (rows.length) {
+      tables.push({ rows });
+      return `\n__TABLE_${idx}__\n`;
+    }
+    return ' ';
+  });
+
+  // 2. Aplanar el resto del HTML
+  return withMarkers
     .replace(/<img[^>]*src="(__IMG_\d+__)"[^>]*/gi,'\n$1\n')
     .replace(/<br\s*\/?>/gi,'\n').replace(/<\/p>/gi,'\n').replace(/<\/h[1-6]>/gi,'\n').replace(/<\/li>/gi,'\n')
     .replace(/<[^>]+>/g,' ')
@@ -408,7 +442,15 @@ function makeDoc(children, name, footerTxt, colorT, colorL, extra={}) {
     sections:[{
       properties:{page:{size:{width:11906,height:16838},margin:{top:1440,right:1440,bottom:1440,left:1440}}},
       headers:{default:new Header({children:[new Paragraph({children:[new TextRun({text:`Suite Académica · ${name}`,font:'Arial',size:18,color:extra.headerColor||'8f8d88'})],border:{bottom:mkBrd(colorL,6)},spacing:{before:0,after:100}})]})},
-      footers:{default:new Footer({children:[new Paragraph({children:[new TextRun({text:`${footerTxt} · `,font:'Arial',size:16,color:extra.headerColor||'8f8d88'}),new TextRun({children:['Pág. ',PageNumber.CURRENT,' / ',PageNumber.TOTAL_PAGES],font:'Arial',size:16,color:extra.headerColor||'8f8d88'})],alignment:AlignmentType.RIGHT,border:{top:mkBrd(colorL,4)},spacing:{before:100,after:0}})]})},
+      footers:{default:new Footer({children:[new Paragraph({
+        children: footerTxt
+          ? [new TextRun({text:`${footerTxt} · `,font:'Arial',size:16,color:extra.headerColor||'8f8d88'}),
+             new TextRun({children:['Pág. ',PageNumber.CURRENT,' / ',PageNumber.TOTAL_PAGES],font:'Arial',size:16,color:extra.headerColor||'8f8d88'})]
+          : [new TextRun({children:['Pág. ',PageNumber.CURRENT,' / ',PageNumber.TOTAL_PAGES],font:'Arial',size:16,color:extra.headerColor||'8f8d88'})],
+        alignment:AlignmentType.RIGHT,
+        border:{top:mkBrd(colorL,4)},
+        spacing:{before:100,after:0}
+      })]})},
       children
     }]
   });
@@ -429,49 +471,117 @@ function buildSummaryDoc(name, text) {
 }
 
 // ── Maquetación: Word con colores personalizables (plantilla) ─────────────────
-function buildMaquetadoDoc(data, imageStore, colors, quiz) {
+function buildMaquetadoDoc(data, imageStore, tableStore, colors, quiz) {
   // colors es un objeto de la plantilla aplicada
   const C = colors || DEFAULT_TEMPLATES[0].colors;
   const CH1 = C.h1, CH2 = C.h2, CH3 = C.h3;
   const CL1 = C.lineH1, CL2 = C.lineH2;
-  const CTT = C.title || CH2;
+  const CTT = C.title || CH1;
   const CBD = C.brd || 'D0CEC8';
   const HDR = C.header || '8f8d88';
 
+  // Título principal del documento como Heading 1 con punto al final.
+  const docTitleText = ensurePeriod(String(data.title || 'Documento maquetado').trim());
   const children = [
     new Paragraph({
-      children:[new TextRun({text:data.title||'Documento maquetado',font:'Arial',size:40,bold:true,color:CTT})],
-      spacing:{before:0,after:480},
+      heading: HeadingLevel.HEADING_1,
+      children:[new TextRun({text: docTitleText, font:'Arial', size:40, bold:true, color:CTT})],
+      spacing:{before:0, after:480},
       alignment:AlignmentType.CENTER,
-      border:{bottom:{style:BorderStyle.SINGLE,size:8,color:CL1}}
+      border:{bottom:{style:BorderStyle.SINGLE, size:8, color:CL1}}
     })
   ];
 
+  // Generador del bloque "tabla comentada" que acompaña a cada tabla
+  function addTable(tableIdx) {
+    const tbl = tableStore && tableStore[tableIdx];
+    if (!tbl || !Array.isArray(tbl.rows) || !tbl.rows.length) {
+      children.push(new Paragraph({
+        children:[new TextRun({text:`[Tabla ${tableIdx+1}]`, font:'Arial', size:20, color:'888780', italics:true})],
+        alignment:AlignmentType.CENTER,
+        spacing:{before:120, after:120}
+      }));
+      return;
+    }
+    // Calcular nº máximo de columnas
+    const maxCols = tbl.rows.reduce((m, r) => Math.max(m, r.length), 0);
+
+    // Construir filas, normalizando cada una al nº máximo de columnas
+    const rows = tbl.rows.map((cells, ri) => {
+      const isHeader = ri === 0;
+      const norm = [];
+      for (let i = 0; i < maxCols; i++) norm.push(cells[i] || '');
+      return new TableRow({
+        children: norm.map(text => new TableCell({
+          width: { size: Math.floor(9000 / maxCols), type: WidthType.DXA },
+          shading: isHeader ? { type: ShadingType.SOLID, color: CH2, fill: CH2 } : undefined,
+          children:[new Paragraph({
+            children:[new TextRun({
+              text: ensurePeriod(String(text).trim()),
+              font:'Arial', size:20,
+              bold: isHeader,
+              color: isHeader ? 'FFFFFF' : '1a1917'
+            })],
+            spacing:{before:60, after:60}
+          })]
+        }))
+      });
+    });
+
+    // Pie / cabecera "Tabla N — comentada"
+    children.push(new Paragraph({
+      children:[new TextRun({text:`Tabla ${tableIdx+1}.`, font:'Arial', size:20, italics:true, bold:true, color:CH2})],
+      spacing:{before:160, after:80},
+      alignment:AlignmentType.CENTER
+    }));
+    children.push(new Table({
+      width: { size: 9000, type: WidthType.DXA },
+      rows
+    }));
+    // Recuadro de comentario
+    const totalCells = tbl.rows.reduce((s,r)=>s+r.length,0);
+    const summary = `Esta tabla recoge ${tbl.rows.length} fila${tbl.rows.length!==1?'s':''} y ${maxCols} columna${maxCols!==1?'s':''} con un total de ${totalCells} celdas con datos. Se incluye en este punto del documento por su valor descriptivo. Revisa el cuadro para una lectura detallada de cada fila.`;
+    children.push(new Paragraph({
+      children:[new TextRun({text: summary, font:'Arial', size:20, italics:true, color:'5c5a55'})],
+      alignment:AlignmentType.JUSTIFIED,
+      spacing:{before:120, after:200},
+      border:{
+        top: {style:BorderStyle.SINGLE, size:6, color:CL2, space:8},
+        bottom: {style:BorderStyle.SINGLE, size:6, color:CL2, space:8},
+        left: {style:BorderStyle.SINGLE, size:6, color:CL2, space:8},
+        right: {style:BorderStyle.SINGLE, size:6, color:CL2, space:8}
+      },
+      indent:{left:200, right:200}
+    }));
+  }
+
+  // Construir el cuerpo del documento a partir de los bloques
+  // Soportar la inserción de preguntas inline mediante {t:'qmarker', i:n}
   for (const block of data.blocks||[]) {
     const {t, n, text, items, idx} = block;
     if (t === 'h1') {
       children.push(new Paragraph({
         heading:HeadingLevel.HEADING_1,
-        children:[new TextRun({text:(n?n+' ':'')+text,font:'Arial',size:30,bold:true,color:CH1})],
+        children:[new TextRun({text:(n?n+' ':'')+ensurePeriod(text||''),font:'Arial',size:30,bold:true,color:CH1})],
         spacing:{before:440,after:180},
         border:{bottom:{style:BorderStyle.SINGLE,size:6,color:CL1}}
       }));
     } else if (t === 'h2') {
       children.push(new Paragraph({
         heading:HeadingLevel.HEADING_2,
-        children:[new TextRun({text:(n?n+' ':'')+text,font:'Arial',size:26,bold:true,color:CH2})],
+        children:[new TextRun({text:(n?n+' ':'')+ensurePeriod(text||''),font:'Arial',size:26,bold:true,color:CH2})],
         spacing:{before:320,after:120},
         border:{bottom:{style:BorderStyle.SINGLE,size:4,color:CL2}}
       }));
     } else if (t === 'h3') {
       children.push(new Paragraph({
         heading:HeadingLevel.HEADING_3,
-        children:[new TextRun({text:(n?n+' ':'')+text,font:'Arial',size:24,bold:true,color:CH3})],
+        children:[new TextRun({text:(n?n+' ':'')+ensurePeriod(text||''),font:'Arial',size:24,bold:true,color:CH3})],
         spacing:{before:260,after:100}
       }));
     } else if (t === 'p' && text) {
       children.push(new Paragraph({
-        children:[new TextRun({text:ensurePeriod(text.trim()),font:'Arial',size:22})],
+        children:[new TextRun({text:ensurePeriod(text.trim()),font:'Arial',size:22, italics: !!block.auto})],
         spacing:{before:0,after:140},
         alignment:AlignmentType.JUSTIFIED
       }));
@@ -490,7 +600,12 @@ function buildMaquetadoDoc(data, imageStore, colors, quiz) {
         children.push(new Paragraph({
           alignment:AlignmentType.CENTER,
           children:[new ImageRun({data:img.data,transformation:{width,height},type:imgType(img.type)})],
-          spacing:{before:200,after:200}
+          spacing:{before:200,after:80}
+        }));
+        children.push(new Paragraph({
+          children:[new TextRun({text:`Figura ${idx+1}.`, font:'Arial', size:20, italics:true, color:'5c5a55'})],
+          alignment:AlignmentType.CENTER,
+          spacing:{before:0, after:200}
         }));
       } catch(_){
         children.push(new Paragraph({
@@ -499,99 +614,171 @@ function buildMaquetadoDoc(data, imageStore, colors, quiz) {
           spacing:{before:120,after:120}
         }));
       }
+    } else if (t === 'table' && typeof idx === 'number') {
+      addTable(idx);
+    } else if (t === 'qmarker' && quiz && Array.isArray(quiz.questions) && typeof block.i === 'number') {
+      // Inserción inline de una pregunta
+      addInlineQuiz(children, quiz, block.i, CH1, CH2, CL1);
     }
   }
 
-  // ── Sección de autoevaluación (opcional) ────────────────────────────────────
-  if (quiz && Array.isArray(quiz.questions) && quiz.questions.length > 0) {
-    const qLetters = ['A','B','C','D','E'];
-    // Cabecera de la sección
-    children.push(new Paragraph({
-      heading:HeadingLevel.HEADING_1,
-      children:[new TextRun({text:'AUTOEVALUACIÓN', font:'Arial', size:30, bold:true, color:CH1})],
-      spacing:{before:600, after:200},
-      border:{bottom:{style:BorderStyle.SINGLE,size:6,color:CL1}},
-      pageBreakBefore:true
-    }));
-    const intro = quiz.type === 'vf'
-      ? 'Indica si cada afirmación es Verdadera (V) o Falsa (F). Las soluciones se encuentran al final.'
-      : `Selecciona la única respuesta correcta de cada pregunta. Las soluciones se encuentran al final.`;
-    children.push(new Paragraph({
-      children:[new TextRun({text:intro, font:'Arial', size:22, italics:true, color:'5c5a55'})],
-      spacing:{before:0, after:240},
-      alignment:AlignmentType.JUSTIFIED
-    }));
-
-    // Preguntas
-    quiz.questions.forEach((q, i) => {
-      // Enunciado
-      children.push(new Paragraph({
-        children:[
-          new TextRun({text:`${i+1}. `, font:'Arial', size:22, bold:true}),
-          new TextRun({text:q.q || '', font:'Arial', size:22})
-        ],
-        spacing:{before:200, after:100},
-        alignment:AlignmentType.JUSTIFIED
-      }));
-      // Opciones
-      if (quiz.type === 'vf') {
-        children.push(new Paragraph({
-          children:[
-            new TextRun({text:'☐ Verdadero            ☐ Falso', font:'Arial', size:22})
-          ],
-          indent:{left:360},
-          spacing:{before:0, after:80}
-        }));
-      } else {
-        const opts = q.options || [];
-        opts.forEach((opt, j) => {
-          children.push(new Paragraph({
-            children:[
-              new TextRun({text:`${qLetters[j]}.  `, font:'Arial', size:22, bold:true}),
-              new TextRun({text:opt, font:'Arial', size:22})
-            ],
-            indent:{left:360},
-            spacing:{before:0, after:60}
-          }));
-        });
-      }
-    });
-
-    // Soluciones
-    children.push(new Paragraph({
-      heading:HeadingLevel.HEADING_1,
-      children:[new TextRun({text:'SOLUCIONES', font:'Arial', size:30, bold:true, color:CH1})],
-      spacing:{before:600, after:200},
-      border:{bottom:{style:BorderStyle.SINGLE,size:6,color:CL1}},
-      pageBreakBefore:true
-    }));
-    quiz.questions.forEach((q, i) => {
-      let ans = '';
-      if (quiz.type === 'vf') {
-        ans = q.correct ? 'Verdadero' : 'Falso';
-      } else {
-        ans = qLetters[q.correct] || '?';
-      }
-      const runs = [
-        new TextRun({text:`${i+1}.  `, font:'Arial', size:22, bold:true}),
-        new TextRun({text:`Respuesta correcta: ${ans}`, font:'Arial', size:22, bold:true, color:CH2})
-      ];
-      if (q.explanation) {
-        runs.push(new TextRun({text:` — ${q.explanation}`, font:'Arial', size:21, color:'5c5a55'}));
-      }
-      children.push(new Paragraph({
-        children:runs,
-        spacing:{before:120, after:80},
-        alignment:AlignmentType.JUSTIFIED
-      }));
-    });
+  // ── Sección de autoevaluación al final (modo 'end') ────────────────────────
+  if (quiz && Array.isArray(quiz.questions) && quiz.questions.length > 0 && (quiz.mode || 'end') === 'end') {
+    appendFinalQuiz(children, quiz, CH1, CL1, CH2);
   }
 
   return makeDoc(children, data.title || 'Documento',
-    'Maquetado SCORMXPRESS · Suite Académica v8.0',
+    null, // sin texto en el pie: solo número de página
     CBD, CBD,
     { h1Size:30, h1Color:CH1, h2Size:26, h2Color:CH2, h3Size:24, h3Color:CH3, headerColor:HDR }
   );
+}
+
+// Inserta una pregunta concreta en línea, dentro del flujo del documento
+function addInlineQuiz(children, quiz, qIdx, CH1, CH2, CL1) {
+  const q = quiz.questions[qIdx];
+  if (!q) return;
+  const qLetters = ['A','B','C','D','E'];
+  // Cabecera ligera de "Pregunta de control"
+  children.push(new Paragraph({
+    children:[new TextRun({text:`Pregunta de control ${qIdx+1}.`, font:'Arial', size:22, bold:true, color:CH2})],
+    spacing:{before:240, after:80},
+    border:{
+      top:{style:BorderStyle.SINGLE, size:4, color:CL1, space:6},
+      left:{style:BorderStyle.SINGLE, size:4, color:CL1, space:6}
+    },
+    indent:{left:120}
+  }));
+  children.push(new Paragraph({
+    children:[new TextRun({text:q.q || '', font:'Arial', size:22})],
+    spacing:{before:0, after:80},
+    alignment:AlignmentType.JUSTIFIED,
+    indent:{left:120}
+  }));
+  if (quiz.type === 'vf') {
+    children.push(new Paragraph({
+      children:[new TextRun({text:'☐ Verdadero            ☐ Falso', font:'Arial', size:22})],
+      indent:{left:480}, spacing:{before:0, after:160}
+    }));
+  } else {
+    const opts = q.options || [];
+    opts.forEach((opt, j) => {
+      children.push(new Paragraph({
+        children:[
+          new TextRun({text:`${qLetters[j]}.  `, font:'Arial', size:22, bold:true}),
+          new TextRun({text:opt, font:'Arial', size:22})
+        ],
+        indent:{left:480}, spacing:{before:0, after: j===opts.length-1?160:60}
+      }));
+    });
+  }
+}
+
+// Añade el bloque final de autoevaluación (modo 'end')
+function appendFinalQuiz(children, quiz, CH1, CL1, CH2) {
+  const qLetters = ['A','B','C','D','E'];
+  children.push(new Paragraph({
+    heading:HeadingLevel.HEADING_1,
+    children:[new TextRun({text:'Autoevaluación.', font:'Arial', size:30, bold:true, color:CH1})],
+    spacing:{before:600, after:200},
+    border:{bottom:{style:BorderStyle.SINGLE, size:6, color:CL1}},
+    pageBreakBefore:true
+  }));
+  const intro = quiz.type === 'vf'
+    ? 'Indica si cada afirmación es Verdadera (V) o Falsa (F). Las soluciones se encuentran al final.'
+    : `Selecciona la única respuesta correcta de cada pregunta. Las soluciones se encuentran al final.`;
+  children.push(new Paragraph({
+    children:[new TextRun({text:intro, font:'Arial', size:22, italics:true, color:'5c5a55'})],
+    spacing:{before:0, after:240},
+    alignment:AlignmentType.JUSTIFIED
+  }));
+  quiz.questions.forEach((q, i) => {
+    children.push(new Paragraph({
+      children:[
+        new TextRun({text:`${i+1}. `, font:'Arial', size:22, bold:true}),
+        new TextRun({text:q.q || '', font:'Arial', size:22})
+      ],
+      spacing:{before:200, after:100},
+      alignment:AlignmentType.JUSTIFIED
+    }));
+    if (quiz.type === 'vf') {
+      children.push(new Paragraph({
+        children:[new TextRun({text:'☐ Verdadero            ☐ Falso', font:'Arial', size:22})],
+        indent:{left:360},
+        spacing:{before:0, after:80}
+      }));
+    } else {
+      const opts = q.options || [];
+      opts.forEach((opt, j) => {
+        children.push(new Paragraph({
+          children:[
+            new TextRun({text:`${qLetters[j]}.  `, font:'Arial', size:22, bold:true}),
+            new TextRun({text:opt, font:'Arial', size:22})
+          ],
+          indent:{left:360},
+          spacing:{before:0, after:60}
+        }));
+      });
+    }
+  });
+  // Soluciones
+  children.push(new Paragraph({
+    heading:HeadingLevel.HEADING_1,
+    children:[new TextRun({text:'Soluciones.', font:'Arial', size:30, bold:true, color:CH1})],
+    spacing:{before:600, after:200},
+    border:{bottom:{style:BorderStyle.SINGLE, size:6, color:CL1}},
+    pageBreakBefore:true
+  }));
+  quiz.questions.forEach((q, i) => {
+    let ans = '';
+    if (quiz.type === 'vf') {
+      ans = q.correct ? 'Verdadero' : 'Falso';
+    } else {
+      ans = qLetters[q.correct] || '?';
+    }
+    const runs = [
+      new TextRun({text:`${i+1}.  `, font:'Arial', size:22, bold:true}),
+      new TextRun({text:`Respuesta correcta: ${ans}`, font:'Arial', size:22, bold:true, color:CH2})
+    ];
+    if (q.explanation) {
+      runs.push(new TextRun({text:` — ${q.explanation}`, font:'Arial', size:21, color:'5c5a55'}));
+    }
+    children.push(new Paragraph({
+      children:runs,
+      spacing:{before:120, after:80},
+      alignment:AlignmentType.JUSTIFIED
+    }));
+  });
+}
+
+// Distribuye preguntas inline en la lista de bloques (modo 'inline').
+// Inserta {t:'qmarker', i:k} en posiciones repartidas, justo después de un párrafo.
+function distributeInlineQuiz(blocks, totalQuestions) {
+  if (!totalQuestions) return blocks;
+  // Posiciones candidatas: tras un párrafo (no auto) o tras un cierre de lista.
+  const candidates = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    if (b.t === 'p' && !b.auto) candidates.push(i);
+    if (b.t === 'ul' || b.t === 'ol') candidates.push(i);
+  }
+  if (!candidates.length) return blocks;
+  // Repartimos uniformemente
+  const out = [];
+  // Mapear de índice de bloque → preguntas a insertar después de ese bloque
+  const insertAfter = new Map();
+  for (let q = 0; q < totalQuestions; q++) {
+    const pick = candidates[Math.floor((q + 0.5) * candidates.length / totalQuestions)];
+    if (!insertAfter.has(pick)) insertAfter.set(pick, []);
+    insertAfter.get(pick).push(q);
+  }
+  for (let i = 0; i < blocks.length; i++) {
+    out.push(blocks[i]);
+    if (insertAfter.has(i)) {
+      for (const qi of insertAfter.get(i)) out.push({ t:'qmarker', i: qi });
+    }
+  }
+  return out;
 }
 
 // ── Chunking de texto para maquetación de documentos largos ───────────────────
@@ -624,48 +811,68 @@ function splitIntoChunks(text, chunkSize = MAQ_CHUNK) {
 
 // ── Prompts de maquetación ────────────────────────────────────────────────────
 function buildMaquetaPrompt(options = {}) {
-  const { hasImages = false, chunkMode = false, chunkInfo = null } = options;
+  const { hasImages = false, hasTables = false, chunkMode = false, chunkInfo = null } = options;
   const imgNote = hasImages
-    ? `\nEl texto contiene marcadores __IMG_N__. Inclúyelos como {"t":"img","idx":N} en la posición correcta del flujo.`
+    ? `\nIMÁGENES: el texto contiene marcadores __IMG_N__. Inclúyelos en el flujo como {"t":"img","idx":N} en EXACTAMENTE la posición original. NO omitas ninguno.`
+    : '';
+  const tblNote = hasTables
+    ? `\nTABLAS: el texto contiene marcadores __TABLE_N__. Inclúyelos como {"t":"table","idx":N} en su posición original. NO omitas ninguna tabla. NO las conviertas en texto, NI las resumas, NI las elimines: la tabla se renderizará automáticamente en el Word, tú solo la referencias por su índice.`
     : '';
   const chunkNote = chunkMode
-    ? `\nESTA ES UNA SECCIÓN de un documento más extenso (${chunkInfo}). Estructura solo lo contenido en esta sección. No inventes un "título" general — devuelve title vacío "" si es una sección intermedia, o si reconoces el título del documento completo, úsalo solo en la primera sección.`
+    ? `\nESTA ES UNA SECCIÓN de un documento más extenso (${chunkInfo}). Estructura solo lo contenido en esta sección. Devuelve title vacío "" si es una sección intermedia. La numeración de los apartados será reasignada después por la aplicación, así que NO te preocupes por continuar la numeración del chunk anterior; numera desde 1 dentro de esta sección.`
     : '';
-  return `Eres experto en maquetación académica SCORMXPRESS. Reestructura este contenido con jerarquía clara para virtualización.
 
-DIRECTRICES OBLIGATORIAS:
+  return `Eres experto en maquetación académica SCORMXPRESS. Reestructura el contenido manteniendo TODO LITERAL.
+
+═══ REGLA #1 — PRESERVACIÓN LITERAL DEL CONTENIDO (CRÍTICA, INNEGOCIABLE) ═══
+- Debes incluir ABSOLUTAMENTE TODO el contenido proporcionado. NO resumir. NO omitir frases. NO acortar.
+- Conserva la redacción original tal cual, incluyendo cifras, fechas, nombres propios, citas y referencias normativas.
+- En textos jurídicos/normativos: preserva LITERALMENTE los términos: "Artículo", "Art.", "Título", "Capítulo", "Sección", "Subsección", "Apartado", "Disposición Adicional", "Disposición Transitoria", "Disposición Derogatoria", "Disposición Final", "Real Decreto", "Decreto", "Ley Orgánica", "Ley", "Orden", "Resolución", "Reglamento", "Anexo", numeración romana (I, II, III), letras de apartado a), b), c), etc.
+- Si el texto fuente dice "Artículo 5.- Las personas..." debes mantener "Artículo 5.- Las personas..." literal en el bloque correspondiente.
+- NO inventes contenido nuevo. NO añadas información que no esté en el original. La única excepción son los breves "puentes" entre títulos consecutivos (ver regla #6).
+- Las imágenes y tablas marcadas con __IMG_N__ y __TABLE_N__ DEBEN aparecer todas, en su posición original.
+
+═══ REGLA #2 — JERARQUÍA Y NUMERACIÓN ═══
 1. Jerarquía máxima de 3 niveles: h1 (sección principal), h2 (subsección), h3 (detalle).
-2. Numeración manual con punto al final en cada título: "1.", "1.1.", "1.1.1.", "2.", etc.
-3. TODO párrafo DEBE terminar con punto final. Cada elemento de lista también DEBE terminar con punto. Esto es CRÍTICO porque el texto se locutará con IA y sin punto la lectura no pausa.
-4. Listas con viñetas (ul) para enumeraciones no ordenadas y listas numeradas (ol) para pasos o secuencias.
-5. Incluye TODO el contenido original reorganizado — no resumas ni elimines información.
-6. Los párrafos deben ser unidades de texto completas y coherentes. No cortes frases.
-7. No uses negritas dentro del texto de los párrafos; usa h2 o h3 para resaltar términos clave.${imgNote}${chunkNote}
+2. NUMERACIÓN: indica la numeración propuesta en el campo "n" ("1.", "1.1.", "1.1.1.", "2.", etc.). La aplicación reasignará la numeración global, pero respeta la JERARQUÍA: h1 lleva un nivel ("1."), h2 dos niveles ("1.1."), h3 tres niveles ("1.1.1.").
+3. NO saltes niveles (no pongas h3 si el padre lógico no es h2).
+4. No abras un h1 nuevo dentro de la misma sección temática; usa h2.
 
-REGLAS CRÍTICAS PARA NO CONFUNDIR ELEMENTOS CON TÍTULOS (esto es donde más fallan los modelos):
-- Un h1/h2/h3 debe ir SIEMPRE seguido de contenido sustancial (al menos un párrafo de varias frases o varios elementos de lista). NO marques como título un texto si tras él no hay desarrollo, o sólo hay otro título inmediato.
+═══ REGLA #3 — PUNTO FINAL OBLIGATORIO ═══
+- TODO bloque de texto (h1, h2, h3, p, items de listas) DEBE terminar con punto final ".".
+- También los TÍTULOS y subtítulos llevan punto al final ("1. Introducción.", "1.1. Antecedentes históricos.").
+- Esto es crítico porque el texto se locutará con IA y sin punto la lectura no pausa correctamente.
+
+═══ REGLA #4 — DISTINCIÓN PÁRRAFO vs TÍTULO ═══
+- Un h1/h2/h3 debe ir SIEMPRE seguido de contenido sustancial (al menos un párrafo de varias frases o varios elementos de lista).
 - ELEMENTOS DE LISTA: viñetas, ítems numerados (a), b), c) — 1º, 2º, 3º — i, ii, iii — •, –, *) NUNCA se marcan como h1/h2/h3. Van como items dentro de "ul" u "ol".
-- EPÍGRAFES CORTOS / ETIQUETAS DE CAMPO: textos breves que actúan como rótulo seguidos del valor en la misma frase, tipo "OBJETIVO:", "REQUISITOS:", "DEFINICIÓN:", "PLAZO:", "EJEMPLO:", "ART. 5:" → NO son títulos. Inclúyelos dentro del párrafo, integrando el valor: "El objetivo es…", "Los requisitos son los siguientes:".
-- ARTÍCULOS / APARTADOS NUMERADOS dentro de un texto normativo: "Artículo 5.-", "Apartado a)", "Punto 3.1.", "Disposición Adicional Primera" → si son cabecera de un articulado completo con varios párrafos debajo, sí pueden ser h2/h3; si son sólo numeración de un punto dentro de una enumeración, van como item de lista o dentro del párrafo.
-- FRASES EN MAYÚSCULAS sueltas o de énfasis: si no introducen un bloque sustancial, son énfasis dentro del texto, no títulos. Inclúyelas en mayúsculas al inicio del párrafo correspondiente.
+- EPÍGRAFES CORTOS / ETIQUETAS DE CAMPO ("OBJETIVO:", "REQUISITOS:", "DEFINICIÓN:", "PLAZO:", "ART. 5:") cuando van seguidos del valor en la misma frase NO son títulos: inclúyelos dentro del párrafo.
+- ARTÍCULOS dentro de un texto normativo: "Artículo 5.-", "Apartado a)", "Disposición Adicional Primera" — si son cabecera de un articulado completo con varios párrafos debajo, sí son h2/h3; si son sólo numeración de un punto dentro de una enumeración, van como item.
 - PIES DE IMAGEN, citas, notas al pie: van como párrafo, NUNCA como título.
-- En caso de duda entre marcar un texto como título o como párrafo: elige PÁRRAFO. Es mucho peor crear títulos falsos que perder algún subtítulo.
+- En caso de duda entre marcar un texto como título o como párrafo: elige PÁRRAFO.
 
-REGLA DE COHERENCIA JERÁRQUICA:
-- No saltes niveles (no pongas h3 si el padre lógico no es h2).
-- No abras un h1 nuevo dentro de la misma sección temática; usa h2.
-- Si solo hay UNA subsección bajo un h1, no hace falta crear un h2.
+═══ REGLA #5 — LISTAS ═══
+- Listas con viñetas (ul) para enumeraciones no ordenadas y listas numeradas (ol) para pasos o secuencias.
+- Cada item termina en punto.
 
+═══ REGLA #6 — TRANSICIONES ENTRE TÍTULOS CONSECUTIVOS ═══
+- Si tras un h1, h2 o h3 NO hay contenido sustancial original antes del siguiente h2/h3 (es decir, dos títulos consecutivos sin texto entre ellos), añade un BREVE párrafo introductorio (1-3 frases) de cosecha propia que presente brevemente el contenido del subapartado siguiente y enlace con la sección anterior. Marca este párrafo con "auto":true para identificarlo.
+- Ejemplo: si hay h1 "5. Procedimiento administrativo." inmediatamente seguido de h2 "5.1. Iniciación.", inserta entre ellos un párrafo tipo: {"t":"p","auto":true,"text":"El procedimiento administrativo se desarrolla a través de varias fases. A continuación se examinan en detalle, comenzando por la fase de iniciación."}.
+- Estos párrafos auto SOLO se generan cuando faltan; NO sustituyen ni resumen el contenido original.${imgNote}${tblNote}${chunkNote}
+
+═══ FORMATO DE SALIDA ═══
 Devuelve ÚNICAMENTE JSON válido (sin texto antes ni después, sin \`\`\`json) con esta estructura:
 {
   "title": "Título del documento (vacío si es sección intermedia)",
   "blocks": [
-    {"t":"h1","n":"1.","text":"Título de sección"},
-    {"t":"h2","n":"1.1.","text":"Subtítulo"},
+    {"t":"h1","n":"1.","text":"Título de sección."},
+    {"t":"p","auto":true,"text":"Breve párrafo puente generado automáticamente."},
+    {"t":"h2","n":"1.1.","text":"Subtítulo."},
     {"t":"p","text":"Párrafo completo terminado en punto."},
     {"t":"ul","items":["Primer punto terminado en punto.","Segundo punto terminado en punto."]},
     {"t":"ol","items":["Primer paso.","Segundo paso."]},
-    {"t":"img","idx":0}
+    {"t":"img","idx":0},
+    {"t":"table","idx":0}
   ]
 }`;
 }
@@ -677,6 +884,115 @@ function parseMaqJson(raw) {
   const data = JSON.parse(s);
   if (!data.blocks || !Array.isArray(data.blocks)) throw new Error('JSON inválido: falta blocks[]');
   return data;
+}
+
+// ── Post-procesado: renumeración global, puntos finales, transiciones automáticas
+// Toma los bloques y devuelve los bloques limpios + estadísticas.
+function normalizeMaquetaData(data, opts = {}) {
+  const blocks = Array.isArray(data.blocks) ? data.blocks.slice() : [];
+
+  // 0) Eliminar duplicados consecutivos exactos de imágenes/tablas
+  const dedup = [];
+  let lastImgIdx = -1, lastTblIdx = -1;
+  for (const b of blocks) {
+    if (b.t === 'img' && typeof b.idx === 'number') {
+      if (b.idx === lastImgIdx) continue;
+      lastImgIdx = b.idx;
+    } else if (b.t === 'table' && typeof b.idx === 'number') {
+      if (b.idx === lastTblIdx) continue;
+      lastTblIdx = b.idx;
+    } else {
+      lastImgIdx = -1; lastTblIdx = -1;
+    }
+    dedup.push(b);
+  }
+
+  // 1) Insertar transiciones automáticas entre títulos consecutivos (sin texto entre ellos).
+  //    Solo se inserta cuando el modelo no haya generado ya un párrafo "auto":true.
+  const isHeading = b => b && (b.t === 'h1' || b.t === 'h2' || b.t === 'h3');
+  const isContent = b => b && ['p','ul','ol','img','table'].includes(b.t);
+  const withBridges = [];
+  for (let i = 0; i < dedup.length; i++) {
+    withBridges.push(dedup[i]);
+    if (isHeading(dedup[i])) {
+      const next = dedup[i + 1];
+      if (next && isHeading(next)) {
+        // Necesita puente — texto introductorio breve genérico
+        const heading = String(dedup[i].text || '').replace(/\.$/, '').trim();
+        const subheading = String(next.text || '').replace(/\.$/, '').trim();
+        const intro = `En este apartado se desarrolla "${heading}". A continuación se examina ${subheading.toLowerCase() ? `"${subheading}"` : 'el siguiente subapartado'}, abordando los aspectos fundamentales de este bloque temático.`;
+        withBridges.push({ t:'p', auto:true, text: intro });
+      }
+    }
+  }
+
+  // 2) Renumeración global y jerárquica (siempre limpia y secuencial)
+  let counters = [0, 0, 0]; // h1, h2, h3
+  for (const b of withBridges) {
+    if (b.t === 'h1') {
+      counters[0] += 1; counters[1] = 0; counters[2] = 0;
+      b.n = `${counters[0]}.`;
+    } else if (b.t === 'h2') {
+      // Si aparece h2 sin h1, asumimos h1 implícito (counters[0] >= 1)
+      if (counters[0] === 0) counters[0] = 1;
+      counters[1] += 1; counters[2] = 0;
+      b.n = `${counters[0]}.${counters[1]}.`;
+    } else if (b.t === 'h3') {
+      if (counters[0] === 0) counters[0] = 1;
+      if (counters[1] === 0) counters[1] = 1;
+      counters[2] += 1;
+      b.n = `${counters[0]}.${counters[1]}.${counters[2]}.`;
+    }
+  }
+
+  // 3) Forzar punto final en TODO texto (h1/h2/h3/p e items de listas)
+  for (const b of withBridges) {
+    if (['h1','h2','h3','p'].includes(b.t) && b.text) {
+      b.text = ensurePeriod(String(b.text).trim());
+    }
+    if ((b.t === 'ul' || b.t === 'ol') && Array.isArray(b.items)) {
+      b.items = b.items.map(it => ensurePeriod(String(it || '').trim())).filter(Boolean);
+    }
+  }
+
+  // 4) Validar índices de imágenes/tablas; conservarlos solo si están en el rango disponible
+  const imgCount = opts.imgCount || 0;
+  const tblCount = opts.tblCount || 0;
+  const finalBlocks = withBridges.filter(b => {
+    if (b.t === 'img') {
+      if (typeof b.idx !== 'number' || b.idx < 0 || b.idx >= imgCount) return false;
+    }
+    if (b.t === 'table') {
+      if (typeof b.idx !== 'number' || b.idx < 0 || b.idx >= tblCount) return false;
+    }
+    return true;
+  });
+
+  // 5) Si el modelo se ha "saltado" alguna imagen o tabla, las añadimos al final como respaldo
+  //    para asegurar que TODAS aparezcan en el documento (regla del usuario).
+  const usedImg = new Set(finalBlocks.filter(b=>b.t==='img').map(b=>b.idx));
+  const usedTbl = new Set(finalBlocks.filter(b=>b.t==='table').map(b=>b.idx));
+  const missingImg = [];
+  const missingTbl = [];
+  for (let i = 0; i < imgCount; i++) if (!usedImg.has(i)) missingImg.push(i);
+  for (let i = 0; i < tblCount; i++) if (!usedTbl.has(i)) missingTbl.push(i);
+  if (missingImg.length || missingTbl.length) {
+    finalBlocks.push({ t:'h2', n:'', text:'Material gráfico complementario.', _appendix:true });
+    for (const idx of missingImg) finalBlocks.push({ t:'img', idx });
+    for (const idx of missingTbl) finalBlocks.push({ t:'table', idx });
+    // re-numerar para incluir esta cabecera apéndice
+    counters = [0,0,0];
+    for (const b of finalBlocks) {
+      if (b.t === 'h1') { counters[0]+=1; counters[1]=0; counters[2]=0; b.n=`${counters[0]}.`; }
+      else if (b.t === 'h2') { if(counters[0]===0)counters[0]=1; counters[1]+=1; counters[2]=0; b.n=`${counters[0]}.${counters[1]}.`; }
+      else if (b.t === 'h3') { if(counters[0]===0)counters[0]=1; if(counters[1]===0)counters[1]=1; counters[2]+=1; b.n=`${counters[0]}.${counters[1]}.${counters[2]}.`; }
+    }
+  }
+
+  return {
+    title: data.title || '',
+    blocks: finalBlocks
+  };
 }
 
 // ── Prompts de preguntas test (anti-meta + polaridad + anti-repetición) ──────
@@ -796,6 +1112,7 @@ app.post('/api/upload', upload.array('files', MAX_TOPICS), async (req, res) => {
         };
       } else {
         const images = [];
+        const tables = [];
         let textWithMarkers = '';
         try {
           const hr = await mammoth.convertToHtml(
@@ -807,14 +1124,14 @@ app.post('/api/upload', upload.array('files', MAX_TOPICS), async (req, res) => {
                 return { src:`__IMG_${idx}__` };
             }) }
           );
-          textWithMarkers = htmlToText(hr.value);
+          textWithMarkers = htmlToText(hr.value, tables);
         } catch(_) {
           const r = await mammoth.extractRawText({ buffer:file.buffer });
           textWithMarkers = r.value.trim();
         }
-        const words = textWithMarkers.replace(/__IMG_\d+__/g,'').split(/\s+/).filter(Boolean).length;
+        const words = textWithMarkers.replace(/__IMG_\d+__/g,'').replace(/__TABLE_\d+__/g,'').split(/\s+/).filter(Boolean).length;
         if (words < 10) throw new Error(`"${file.originalname}" tiene muy poco texto.`);
-        topic = { id, name:file.originalname, type:'docx', text:textWithMarkers, images, words };
+        topic = { id, name:file.originalname, type:'docx', text:textWithMarkers, images, tables, words };
       }
       topicCache.set(id, { ...topic, ts:Date.now() });
       return {
@@ -822,6 +1139,7 @@ app.post('/api/upload', upload.array('files', MAX_TOPICS), async (req, res) => {
         words: topic.words || null,
         sizeKB: topic.sizeKB || null,
         imageCount: topic.images?.length || 0,
+        tableCount: topic.tables?.length || 0,
         pages: topic.pages || null,
         largeDoc: (topic.text?.length || 0) > MAQ_SINGLE
       };
@@ -1042,7 +1360,7 @@ Estructura: ${dm[depth] || dm.completo}`;
   }
 });
 
-// ── POST /api/maqueta (SSE) — maquetación con chunking para docs grandes ─────
+// ── POST /api/maqueta (SSE) — maquetación con chunking PARALELO + normalización
 app.post('/api/maqueta', async (req, res) => {
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
@@ -1056,6 +1374,7 @@ app.post('/api/maqueta', async (req, res) => {
   if (!topic) { send({type:'error',message:'Tema no encontrado.'}); return res.end(); }
 
   const hasImages = topic.images?.length > 0;
+  const hasTables = topic.tables?.length > 0;
   const textLength = topic.text?.length || 0;
   const useChunking = textLength > MAQ_SINGLE;
 
@@ -1064,23 +1383,27 @@ app.post('/api/maqueta', async (req, res) => {
       // Documento pequeño o PDF nativo: llamada única
       send({ type:'start', mode:'single', totalChunks:1 });
       send({ type:'progress', chunk:1, total:1, pct:20, label:'Analizando estructura del documento...' });
-      const prompt = buildMaquetaPrompt({ hasImages, chunkMode:false });
+      const prompt = buildMaquetaPrompt({ hasImages, hasTables, chunkMode:false });
       const raw = await callClaude(makeMessages(prompt, topic), 16000);
       send({ type:'progress', chunk:1, total:1, pct:85, label:'Procesando respuesta...' });
-      const data = parseMaqJson(raw);
+      let data = parseMaqJson(raw);
+      data = normalizeMaquetaData(data, {
+        imgCount: topic.images?.length || 0,
+        tblCount: topic.tables?.length || 0
+      });
       const stats = (data.blocks || []).reduce((s,b) => { s[b.t] = (s[b.t]||0) + 1; return s; }, {});
       send({
         type:'complete',
         data,
         stats,
         truncated: topic.type === 'docx' && (topic.text?.length || 0) > MAX_CHARS && !useChunking,
-        hasImages,
+        hasImages, hasTables,
         mode:'single'
       });
       return res.end();
     }
 
-    // Documento grande: chunking sobre texto extraído
+    // Documento grande: chunking PARALELO sobre texto extraído
     if (!topic.text) {
       send({ type:'error', message:'No se pudo extraer texto del documento para procesarlo en secciones.' });
       return res.end();
@@ -1089,45 +1412,74 @@ app.post('/api/maqueta', async (req, res) => {
     const chunks = splitIntoChunks(topic.text, MAQ_CHUNK);
     send({ type:'start', mode:'chunked', totalChunks:chunks.length, textLength, pages:topic.pages||null });
 
-    const allBlocks = [];
-    let finalTitle = '';
-
-    for (let i = 0; i < chunks.length; i++) {
-      send({
-        type:'progress',
-        chunk: i+1,
-        total: chunks.length,
-        pct: Math.round((i / chunks.length) * 92) + 2,
-        label: `Maquetando sección ${i+1} de ${chunks.length}...`
-      });
-      const chunkPrompt = buildMaquetaPrompt({
-        hasImages: i === 0 && hasImages, // las imágenes de docx suelen estar repartidas pero los marcadores vienen en el chunk
-        chunkMode: true,
-        chunkInfo: `sección ${i+1} de ${chunks.length}`
-      });
-      const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}" (sección ${i+1}/${chunks.length}):\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
-      try {
-        const raw = await callClaude(msg, 16000);
-        const data = parseMaqJson(raw);
-        if (i === 0 && data.title) finalTitle = data.title;
-        if (Array.isArray(data.blocks)) allBlocks.push(...data.blocks);
-      } catch (e) {
-        // Si falla un chunk, continuamos con los siguientes pero avisamos
-        send({ type:'chunk_error', chunk:i+1, message:e.message });
+    // Procesar chunks con concurrencia limitada para acelerar el maquetado
+    const CONCURRENCY = parseInt(process.env.MAQ_CONCURRENCY || '3');
+    const results = new Array(chunks.length);
+    let completed = 0;
+    let nextIdx = 0;
+    async function worker() {
+      while (nextIdx < chunks.length) {
+        const i = nextIdx++;
+        send({
+          type:'progress',
+          chunk: i+1,
+          total: chunks.length,
+          pct: Math.round((completed / chunks.length) * 92) + 4,
+          label: `Maquetando sección ${i+1} de ${chunks.length}...`
+        });
+        const chunkPrompt = buildMaquetaPrompt({
+          hasImages, hasTables,
+          chunkMode: true,
+          chunkInfo: `sección ${i+1} de ${chunks.length}`
+        });
+        const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}" (sección ${i+1}/${chunks.length}):\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
+        try {
+          const raw = await callClaude(msg, 16000);
+          const data = parseMaqJson(raw);
+          results[i] = data;
+        } catch (e) {
+          send({ type:'chunk_error', chunk:i+1, message:e.message });
+          results[i] = { title:'', blocks: [] };
+        }
+        completed++;
+        send({
+          type:'progress',
+          chunk: completed,
+          total: chunks.length,
+          pct: Math.round((completed / chunks.length) * 92) + 4,
+          label: `Sección ${completed}/${chunks.length} completada.`
+        });
       }
     }
+    const workers = [];
+    for (let w = 0; w < Math.min(CONCURRENCY, chunks.length); w++) workers.push(worker());
+    await Promise.all(workers);
 
-    const finalData = {
+    // Unificar resultados conservando el ORDEN de los chunks
+    const allBlocks = [];
+    let finalTitle = '';
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i] || { blocks: [] };
+      if (i === 0 && r.title) finalTitle = r.title;
+      if (Array.isArray(r.blocks)) allBlocks.push(...r.blocks);
+    }
+
+    let finalData = {
       title: finalTitle || topic.name.replace(/\.[^.]+$/,''),
       blocks: allBlocks
     };
-    const stats = allBlocks.reduce((s,b) => { s[b.t] = (s[b.t]||0) + 1; return s; }, {});
+    finalData = normalizeMaquetaData(finalData, {
+      imgCount: topic.images?.length || 0,
+      tblCount: topic.tables?.length || 0
+    });
+
+    const stats = finalData.blocks.reduce((s,b) => { s[b.t] = (s[b.t]||0) + 1; return s; }, {});
     send({
       type:'complete',
       data: finalData,
       stats,
       truncated: false,
-      hasImages,
+      hasImages, hasTables,
       mode:'chunked',
       processedChunks: chunks.length
     });
@@ -1135,6 +1487,157 @@ app.post('/api/maqueta', async (req, res) => {
   } catch(err) {
     send({ type:'error', message: err.message });
     res.end();
+  }
+});
+
+// ── POST /api/maqueta-batch (SSE) — varios temas en serie ─────────────────────
+app.post('/api/maqueta-batch', async (req, res) => {
+  res.setHeader('Content-Type','text/event-stream');
+  res.setHeader('Cache-Control','no-cache');
+  res.setHeader('Connection','keep-alive');
+  res.setHeader('X-Accel-Buffering','no');
+  res.flushHeaders();
+
+  const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
+  const { topicIds } = req.body;
+  if (!Array.isArray(topicIds) || !topicIds.length) {
+    send({type:'error', message:'Sin documentos seleccionados.'});
+    return res.end();
+  }
+  const topics = topicIds.map(id => topicCache.get(id)).filter(Boolean);
+  if (!topics.length) { send({type:'error', message:'Temas no encontrados.'}); return res.end(); }
+
+  send({ type:'batch_start', total: topics.length });
+  const results = [];
+
+  for (let ti = 0; ti < topics.length; ti++) {
+    const topic = topics[ti];
+    send({ type:'topic_start', ti, name:topic.name, total: topics.length });
+
+    const hasImages = topic.images?.length > 0;
+    const hasTables = topic.tables?.length > 0;
+    const textLength = topic.text?.length || 0;
+    const useChunking = textLength > MAQ_SINGLE;
+
+    try {
+      let finalData;
+      if (!useChunking) {
+        send({ type:'topic_progress', ti, pct:30, label:'Analizando estructura...' });
+        const prompt = buildMaquetaPrompt({ hasImages, hasTables, chunkMode:false });
+        const raw = await callClaude(makeMessages(prompt, topic), 16000);
+        const data = parseMaqJson(raw);
+        send({ type:'topic_progress', ti, pct:80, label:'Normalizando resultado...' });
+        finalData = normalizeMaquetaData(data, {
+          imgCount: topic.images?.length || 0,
+          tblCount: topic.tables?.length || 0
+        });
+      } else {
+        const chunks = splitIntoChunks(topic.text, MAQ_CHUNK);
+        send({ type:'topic_progress', ti, pct:5, label:`Documento grande · ${chunks.length} secciones.` });
+        const CONCURRENCY = parseInt(process.env.MAQ_CONCURRENCY || '3');
+        const arr = new Array(chunks.length);
+        let completed = 0, nextIdx = 0;
+        async function worker() {
+          while (nextIdx < chunks.length) {
+            const i = nextIdx++;
+            const chunkPrompt = buildMaquetaPrompt({
+              hasImages, hasTables, chunkMode:true,
+              chunkInfo:`sección ${i+1} de ${chunks.length}`
+            });
+            const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}" (sección ${i+1}/${chunks.length}):\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
+            try {
+              const raw = await callClaude(msg, 16000);
+              arr[i] = parseMaqJson(raw);
+            } catch(e) {
+              arr[i] = { title:'', blocks:[] };
+            }
+            completed++;
+            send({ type:'topic_progress', ti,
+              pct: 5 + Math.round((completed / chunks.length) * 85),
+              label: `Sección ${completed}/${chunks.length}` });
+          }
+        }
+        const workers = [];
+        for (let w = 0; w < Math.min(CONCURRENCY, chunks.length); w++) workers.push(worker());
+        await Promise.all(workers);
+        const allBlocks = [];
+        let finalTitle = '';
+        for (let i = 0; i < arr.length; i++) {
+          const r = arr[i] || { blocks: [] };
+          if (i === 0 && r.title) finalTitle = r.title;
+          if (Array.isArray(r.blocks)) allBlocks.push(...r.blocks);
+        }
+        finalData = normalizeMaquetaData({
+          title: finalTitle || topic.name.replace(/\.[^.]+$/,''),
+          blocks: allBlocks
+        }, {
+          imgCount: topic.images?.length || 0,
+          tblCount: topic.tables?.length || 0
+        });
+      }
+
+      const stats = finalData.blocks.reduce((s,b) => { s[b.t] = (s[b.t]||0) + 1; return s; }, {});
+      results.push({ topicId: topic.id, name: topic.name, data: finalData, stats });
+      send({ type:'topic_complete', ti, name:topic.name, data:finalData, stats, hasImages, hasTables });
+    } catch(err) {
+      send({ type:'topic_error', ti, name:topic.name, message:err.message });
+    }
+  }
+
+  send({ type:'batch_complete', total: topics.length, results });
+  res.end();
+});
+
+// ── POST /api/maqueta-zip — empaqueta varios .docx maquetados en un ZIP ──────
+app.post('/api/maqueta-zip', async (req, res) => {
+  const { items, templateId, colors } = req.body;
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error:'Sin documentos.' });
+
+  // Resolver colores comunes para todo el lote
+  let finalColors = null;
+  if (colors && typeof colors === 'object') {
+    finalColors = { ...DEFAULT_TEMPLATES[0].colors, ...colors };
+  } else if (templateId) {
+    const tpls = getUserTemplates(req.user.id);
+    const t = tpls.find(x => x.id === templateId);
+    if (t) finalColors = t.colors;
+  }
+
+  try {
+    const zip = new JSZip();
+    for (const it of items) {
+      const { data, topicId, quiz } = it;
+      if (!data || !Array.isArray(data.blocks)) continue;
+      const topic = topicId ? topicCache.get(topicId) : null;
+      const imageStore = topic?.images || null;
+      const tableStore = topic?.tables || null;
+
+      let cleanQuiz = null;
+      if (quiz && Array.isArray(quiz.questions) && quiz.questions.length) {
+        cleanQuiz = {
+          type: ['vf','3opt','4opt'].includes(quiz.type) ? quiz.type : '4opt',
+          mode: ['inline','end'].includes(quiz.mode) ? quiz.mode : 'end',
+          questions: quiz.questions
+        };
+        if (cleanQuiz.mode === 'inline') {
+          data.blocks = distributeInlineQuiz(data.blocks, cleanQuiz.questions.length);
+        }
+      }
+
+      const doc = buildMaquetadoDoc(data, imageStore, tableStore, finalColors, cleanQuiz);
+      const buf = await Packer.toBuffer(doc);
+      const safe = (data.title || topic?.name || 'documento')
+        .replace(/\.[^.]+$/, '')
+        .replace(/[^\w\-áéíóúüñÁÉÍÓÚÜÑ ]/g,'_')
+        .substring(0,60).trim() || 'documento';
+      zip.file(`${safe}_maquetado.docx`, buf);
+    }
+    const buf = await zip.generateAsync({ type:'nodebuffer', compression:'DEFLATE' });
+    res.setHeader('Content-Type','application/zip');
+    res.setHeader('Content-Disposition','attachment; filename="maquetados.zip"');
+    res.send(buf);
+  } catch(err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1216,7 +1719,9 @@ app.post('/api/maqueta-docx', async (req, res) => {
   const { data, topicId, templateId, colors, quiz } = req.body;
   if (!data || !Array.isArray(data.blocks)) return res.status(400).json({ error:'Sin datos.' });
   try {
-    const imageStore = topicId ? topicCache.get(topicId)?.images : null;
+    const topic = topicId ? topicCache.get(topicId) : null;
+    const imageStore = topic?.images || null;
+    const tableStore = topic?.tables || null;
 
     // Resolver colores: custom > templateId > defecto
     let finalColors = null;
@@ -1233,11 +1738,16 @@ app.post('/api/maqueta-docx', async (req, res) => {
     if (quiz && Array.isArray(quiz.questions) && quiz.questions.length) {
       cleanQuiz = {
         type: ['vf','3opt','4opt'].includes(quiz.type) ? quiz.type : '4opt',
+        mode: ['inline','end'].includes(quiz.mode) ? quiz.mode : 'end',
         questions: quiz.questions
       };
+      if (cleanQuiz.mode === 'inline') {
+        // Insertamos marcadores qmarker en posiciones repartidas
+        data.blocks = distributeInlineQuiz(data.blocks, cleanQuiz.questions.length);
+      }
     }
 
-    const doc = buildMaquetadoDoc(data, imageStore, finalColors, cleanQuiz);
+    const doc = buildMaquetadoDoc(data, imageStore, tableStore, finalColors, cleanQuiz);
     const buf = await Packer.toBuffer(doc);
     const safe = (data.title || 'documento')
       .replace(/[^\w\-áéíóúüñÁÉÍÓÚÜÑ ]/g,'_')
@@ -1470,10 +1980,10 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 // ── Arranque ──────────────────────────────────────────────────────────────────
 initUsers().then(() => {
   app.listen(PORT, HOST, () => {
-    console.log(`\n✅  Suite Académica Moodle · v8.0`);
+    console.log(`\n✅  Suite Académica Moodle · v8.1`);
     console.log(`   URL    : http://${HOST==='0.0.0.0'?'localhost':HOST}:${PORT}`);
     console.log(`   Modelo : ${MODEL}`);
     console.log(`   Usuarios: ${loadUsers().length} registrados`);
-    console.log(`   Límites: chunk=${MAQ_CHUNK} · single=${MAQ_SINGLE} · historial=${HISTORY_LIMIT}\n`);
+    console.log(`   Maquetación: chunk=${MAQ_CHUNK} · single=${MAQ_SINGLE} · concurrencia=${process.env.MAQ_CONCURRENCY || '3'} · historial=${HISTORY_LIMIT}\n`);
   });
 });
