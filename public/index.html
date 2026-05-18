@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Suite Académica · Moodle v8.1</title>
+<title>Suite Académica · Moodle v9.0</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -245,7 +245,7 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
 <header class="topbar">
   <div class="brand"><h1>Suite Académica para Moodle</h1><p>Preguntas test · Resúmenes · Mapas · Maquetación · Historial · Plantillas de color</p></div>
   <div style="display:flex;align-items:center;gap:10px">
-    <span class="badge">v8.1</span>
+    <span class="badge">v9.0</span>
     <button class="user-btn" id="userBtn" onclick="openPanel()">
       <span class="user-dot"></span>
       <span id="userBtnLabel">Cargando...</span>
@@ -370,6 +370,10 @@ input[type=range].pos{accent-color:#085041}input[type=range].neg{accent-color:#A
   <!-- Sidebar M -->
   <div id="sb-m" style="display:none"><div class="card">
     <div class="card-title">Configuración mapa</div>
+    <div class="field"><div class="flbl">Estilo</div>
+      <div class="seg"><button class="on" id="msRad" onclick="setMapStyle('radial')">Radial</button><button id="msNov" onclick="setMapStyle('novak')">Conceptual (Novak)</button></div>
+      <div id="styleHint" style="font-size:11px;color:var(--txt3);margin-top:3px">Mapa radial: centro → ramas → subnodos.</div>
+    </div>
     <div class="field"><div class="flbl">Tema</div><div class="tsel" id="mapSel"></div><div style="font-size:11px;color:var(--txt3);margin-top:4px">Un mapa por generación.</div></div>
     <div class="field"><div class="flbl">Nivel de detalle</div><div class="seg3" id="segDepth"><button onclick="setCfg('mapDepth','simple');actSeg('segDepth',0)">Simple</button><button class="on" onclick="setCfg('mapDepth','completo');actSeg('segDepth',1)">Completo</button><button onclick="setCfg('mapDepth','detallado');actSeg('segDepth',2)">Detallado</button></div><div id="depthHint" style="font-size:11px;color:var(--txt3);margin-top:3px">6-7 ramas · 3-4 subnodos</div></div>
   </div></div>
@@ -623,7 +627,7 @@ const cfg = {
   polarityMode:'positive', polarityPositivePct:80,
   minW:30, maxW:80,
   expMode:'unico', penalty:'none',
-  pages:3, mapDepth:'completo',
+  pages:3, mapDepth:'completo', mapStyle:'radial',
   // Maquetación → autoevaluación integrada
   maqQuizEnabled:false, maqQuizType:'3opt', maqQuizNum:10, maqQuizDiff:'medio', maqQuizDist:'end'
 };
@@ -681,7 +685,7 @@ function refreshUI(tab){
     if(has){$('qDesc').textContent=`${cfg.qMode==='pertopic'?cfg.numQ+' preg/tema × '+topics.length+' temas':cfg.numQ+' preguntas'} · ${cfg.numOpts} opciones · ${cfg.polarityMode==='positive'?'positivas':cfg.polarityMode==='negative'?'negativas':'mixtas'}`;$('btnGen').textContent=`Generar banco (~${total} preguntas)`;}
   }
   if(t==='s'){$('s-empty').style.display=has?'none':'block';$('s-actions').style.display=has?'block':'none';renderTopicSel('sumSel','sum');const sel=getSelected('sum');if(has){$('sDesc').textContent=sel.length?`${sel.length} tema${sel.length!==1?'s':''} · ${cfg.pages} pág. c/u (≈${cfg.pages*480} pal.)`:'Selecciona al menos un tema';$('btnSum').disabled=sel.length===0;}}
-  if(t==='m'){$('m-empty').style.display=has?'none':'block';$('m-actions').style.display=has?'block':'none';renderTopicSel('mapSel','map');const dh={simple:'4-5 ramas · 2-3 subnodos',completo:'6-7 ramas · 3-4 subnodos',detallado:'7-8 ramas · 4-5 subnodos'};$('depthHint').textContent=dh[cfg.mapDepth]||'';}
+  if(t==='m'){$('m-empty').style.display=has?'none':'block';$('m-actions').style.display=has?'block':'none';renderTopicSel('mapSel','map');const dh=cfg.mapStyle==='novak'?{simple:'~8 conceptos · 1 nivel',completo:'~16 conceptos · 2 niveles + cross-links',detallado:'~24 conceptos · 3 niveles + cross-links'}:{simple:'4-5 ramas · 2-3 subnodos',completo:'6-7 ramas · 3-4 subnodos',detallado:'7-8 ramas · 4-5 subnodos'};$('depthHint').textContent=dh[cfg.mapDepth]||'';}
   if(t==='ma'){
     $('ma-empty').style.display=has?'none':'block';
     renderTopicSel('maqSel','maq');
@@ -895,7 +899,7 @@ function aikenToGift(aikenText,penalty){
   const pm={none:null,third:-33.33333,half:-50,full:-100};const pp=pm[penalty];
   function escG(s){return s.replace(/([~={#}:])/g,'\\$1');}
   const lines=aikenText.split('\n');
-  let out='// GIFT — Suite Académica Moodle v8.1\n// Penalización: '+penalty+'\n\n';
+  let out='// GIFT — Suite Académica Moodle v9.0\n// Penalización: '+penalty+'\n\n';
   let i=0,qn=0;
   while(i<lines.length){
     const line=lines[i].trim();
@@ -1025,19 +1029,23 @@ async function dlSummaryDocx(r){
 }
 
 // ── Mapas ─────────────────────────────────────────────────────────────────────
+function setMapStyle(s){cfg.mapStyle=s;$('msRad').classList.toggle('on',s==='radial');$('msNov').classList.toggle('on',s==='novak');$('styleHint').textContent=s==='novak'?'Mapa Novak: conceptos + frases de enlace + cross-links.':'Mapa radial: centro → ramas → subnodos.';refreshUI('m');}
 async function genMap(){
   const selIds=getSelected('map');if(!selIds.length||busy)return;
   busy=true;mapSVG='';showPanel('m','progress');
   try{
-    const res=await fetch('/api/map',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topicId:selIds[0],depth:cfg.mapDepth})});
+    const res=await fetch('/api/map',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({topicId:selIds[0],depth:cfg.mapDepth,style:cfg.mapStyle})});
     const data=await res.json();
     if(!data.success)throw new Error(data.error);
-    const result=buildMapSVG(data.data);
+    const result=data.style==='novak'?buildNovakSVG(data.data):buildMapSVG(data.data);
     mapSVG=result.svg;mapW=result.width;mapH=result.height;
     $('mapWrap').innerHTML=mapSVG;showPanel('m','results');
-    // Historial
+    // Historial (compatible con ambos estilos)
     const tp=topics.find(t=>t.id===selIds[0]);
-    saveToHistory('map',data.data.title||(tp?tp.name.replace(/\.[^.]+$/,''):'Mapa'),{depth:cfg.mapDepth,branches:data.data.branches.length},{mapData:data.data,svg:mapSVG,width:mapW,height:mapH});
+    const histMeta=data.style==='novak'
+      ? {depth:cfg.mapDepth,style:'novak',concepts:data.data.concepts.length,propositions:data.data.propositions.length}
+      : {depth:cfg.mapDepth,style:'radial',branches:data.data.branches.length};
+    saveToHistory('map',data.data.title||(tp?tp.name.replace(/\.[^.]+$/,''):'Mapa'),histMeta,{mapData:data.data,mapStyle:data.style,svg:mapSVG,width:mapW,height:mapH});
   }catch(e){showErr('m','Error: '+e.message);showPanel('m','actions');}
   busy=false;
 }
@@ -1059,6 +1067,170 @@ function buildMapSVG(data){
   });
   svg+=rbox(rX,rY,RW,RH,9,'#1a1917','#1a1917',data.title,'white',12,600);
   return{svg:svg+'</svg>',width:W,height:H};
+}
+
+// ── Render Novak: conceptos + frases de enlace compartidas + cross-links ─────
+function buildNovakSVG(data){
+  const concepts=data.concepts||[];
+  const props=(data.propositions||[]).filter(p=>p&&p.from&&p.to&&p.phrase);
+  if(!concepts.length)return{svg:'<svg></svg>',width:0,height:0};
+
+  const PAL=[
+    {bg:'#1a1917',t:'#fff',s:'#1a1917'},        // nivel 0 (raíz oscura)
+    {bg:'#e1f5ee',t:'#04342C',s:'#085041'},     // nivel 1 (verde)
+    {bg:'#e6f1fb',t:'#042C53',s:'#185FA5'},     // nivel 2 (azul)
+    {bg:'#faeeda',t:'#412402',s:'#854F0B'},     // nivel 3+ (ámbar)
+    {bg:'#EEEDFE',t:'#26215C',s:'#534AB7'},     // nivel 4 (violeta)
+  ];
+  function boxSize(lv){if(lv===0)return{w:210,h:62};if(lv===1)return{w:160,h:54};return{w:140,h:44};}
+
+  const byLevel={};
+  concepts.forEach(c=>{const lv=Math.max(0,Math.min(c.level??0,4));(byLevel[lv]=byLevel[lv]||[]).push({...c,level:lv});});
+  const levels=Object.keys(byLevel).map(Number).sort((a,b)=>a-b);
+  function parentOf(id){const e=props.find(p=>p.to===id);return e?e.from:null;}
+  levels.forEach(lv=>{if(lv===0)return;byLevel[lv].sort((a,b)=>{const pa=parentOf(a.id)||'',pb=parentOf(b.id)||'';return pa.localeCompare(pb);});});
+
+  const PAD_X=40,PAD_Y=40,GAP_X=28,GAP_Y=145;
+  const levelWidths={};
+  levels.forEach(lv=>{const items=byLevel[lv];levelWidths[lv]=items.reduce((s,c)=>s+boxSize(c.level).w,0)+(items.length-1)*GAP_X;});
+  const W=Math.max(...Object.values(levelWidths),600)+PAD_X*2;
+  const H=levels.length*GAP_Y+PAD_Y*2;
+
+  const pos={};
+  levels.forEach((lv,lvIdx)=>{
+    const items=byLevel[lv];
+    const totalW=levelWidths[lv];
+    let x=(W-totalW)/2;
+    const y=PAD_Y+lvIdx*GAP_Y;
+    items.forEach(c=>{const sz=boxSize(c.level);pos[c.id]={x:x+sz.w/2,y:y+sz.h/2,w:sz.w,h:sz.h,level:c.level};x+=sz.w+GAP_X;});
+  });
+
+  function wrap(phrase,maxC,maxLines){
+    if(phrase.length<=maxC)return[phrase];
+    const words=phrase.split(' '),lines=[];
+    let i=0;
+    while(i<words.length&&lines.length<maxLines-1){
+      let line='';
+      while(i<words.length){
+        const cand=line?line+' '+words[i]:words[i];
+        if(cand.length>maxC&&line)break;
+        line=cand; i++;
+      }
+      lines.push(line);
+    }
+    let last=words.slice(i).join(' ');
+    if(last){if(last.length>maxC)last=last.substring(0,maxC-1)+'…';lines.push(last);}
+    for(let j=0;j<lines.length;j++)if(lines[j].length>maxC)lines[j]=lines[j].substring(0,maxC-1)+'…';
+    return lines;
+  }
+
+  // Agrupar proposiciones por (origen, frase) — una pastilla con flechas en abanico
+  const groups=new Map();
+  props.forEach(p=>{
+    const key=p.from+'\u0001'+(p.phrase||'').trim();
+    if(!groups.has(key))groups.set(key,{from:p.from,phrase:p.phrase,tos:[]});
+    if(!groups.get(key).tos.includes(p.to))groups.get(key).tos.push(p.to);
+  });
+
+  let svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" font-family="'Segoe UI',system-ui,sans-serif"><rect width="${W}" height="${H}" fill="white"/>`;
+  svg+=`<defs><marker id="arrN" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5c5a55"/></marker></defs>`;
+
+  groups.forEach(g=>{
+    const a=pos[g.from];
+    const targets=g.tos.map(id=>pos[id]).filter(Boolean);
+    if(!a||!targets.length)return;
+    const phrase=(g.phrase||'').trim();
+    const FS=10.5,LH=FS+2,CHARW=FS*0.55;
+
+    // Cross-link (1 destino, mismo nivel)
+    if(targets.length===1&&a.level===targets[0].level){
+      const b=targets[0];
+      const goRight=a.x<b.x;
+      const x1=a.x+(goRight?a.w/2:-a.w/2),y1=a.y;
+      const x2=b.x+(goRight?-b.w/2:b.w/2),y2=b.y;
+      const mx=(x1+x2)/2,my=y1-26;
+      svg+=`<path d="M${x1},${y1} Q${mx},${my} ${x2},${y2}" fill="none" stroke="#5c5a55" stroke-width="1.2" opacity="0.65" stroke-dasharray="4 3" marker-end="url(#arrN)"/>`;
+      if(phrase){
+        const maxC=Math.max(14,Math.floor((Math.max(230,Math.abs(x2-x1)*0.8)-14)/CHARW));
+        const lines=wrap(phrase,maxC,2);
+        const realCh=Math.max(...lines.map(l=>l.length));
+        const tw=realCh*CHARW+14,th=lines.length*LH+6;
+        svg+=`<rect x="${mx-tw/2}" y="${my-th/2}" width="${tw}" height="${th}" rx="9" fill="#fff" stroke="#5c5a55" stroke-width="0.8" opacity="0.97"/>`;
+        const sY=my-(lines.length-1)*LH/2;
+        lines.forEach((ln,i)=>svg+=`<text x="${mx}" y="${sY+i*LH}" text-anchor="middle" dominant-baseline="central" font-size="${FS}" fill="#1a1917" font-style="italic">${esc(ln)}</text>`);
+      }
+      return;
+    }
+
+    // Jerárquico: pastilla compartida + flechas en abanico
+    const cx=targets.reduce((s,t)=>s+t.x,0)/targets.length;
+    const tTopY=targets.reduce((s,t)=>s+(t.y-t.h/2),0)/targets.length;
+    const px=cx;
+    const py=(a.y+a.h/2+tTopY)/2;
+
+    let tw=0,th=0,phraseLines=[];
+    if(phrase){
+      const minTx=Math.min(...targets.map(t=>t.x));
+      const maxTx=Math.max(...targets.map(t=>t.x));
+      const span=Math.max(240,(maxTx-minTx)*0.85,Math.abs(a.x-cx)*1.1);
+      const maxC=Math.max(16,Math.floor((span-14)/CHARW));
+      phraseLines=wrap(phrase,maxC,2);
+      const realCh=Math.max(...phraseLines.map(l=>l.length));
+      tw=realCh*CHARW+14;
+      th=phraseLines.length*LH+6;
+    }
+
+    // Origen → top de la pastilla
+    const sx=a.x,sy=a.y+a.h/2;
+    const pTop=py-th/2;
+    const cy1=sy+(pTop-sy)*0.55;
+    svg+=`<path d="M${sx},${sy} C${sx},${cy1} ${px},${pTop-6} ${px},${pTop}" fill="none" stroke="#5c5a55" stroke-width="1.3" opacity="0.7"/>`;
+
+    // Pastilla con texto
+    if(phrase){
+      svg+=`<rect x="${px-tw/2}" y="${py-th/2}" width="${tw}" height="${th}" rx="9" fill="#fff" stroke="#5c5a55" stroke-width="0.8" opacity="0.97"/>`;
+      const sY=py-(phraseLines.length-1)*LH/2;
+      phraseLines.forEach((ln,i)=>svg+=`<text x="${px}" y="${sY+i*LH}" text-anchor="middle" dominant-baseline="central" font-size="${FS}" fill="#1a1917" font-style="italic">${esc(ln)}</text>`);
+    }
+
+    // Pastilla → cada destino
+    const pBot=py+th/2;
+    targets.forEach(b=>{
+      const bx=b.x,by=b.y-b.h/2;
+      const cyb=pBot+(by-pBot)*0.55;
+      svg+=`<path d="M${px},${pBot} C${px},${pBot+6} ${bx},${cyb} ${bx},${by}" fill="none" stroke="#5c5a55" stroke-width="1.3" opacity="0.7" marker-end="url(#arrN)"/>`;
+    });
+  });
+
+  // Conceptos encima
+  concepts.forEach(c=>{
+    const p=pos[c.id];if(!p)return;
+    const palette=PAL[Math.min(c.level??0,PAL.length-1)];
+    const x=p.x-p.w/2,y=p.y-p.h/2;
+    const fs=c.level===0?12.5:(c.level===1?12:11);
+    const fw=c.level===0?700:(c.level===1?600:500);
+    const rad=c.level===0?12:8;
+    const sw=c.level===0?1.8:1.2;
+    svg+=`<rect x="${x}" y="${y}" width="${p.w}" height="${p.h}" rx="${rad}" fill="${palette.bg}" stroke="${palette.s}" stroke-width="${sw}"/>`;
+    const maxC=Math.floor((p.w-12)/(fs*0.52));
+    const text=(c.text||'').replace(/\\n/g,'\n');
+    const rawLines=text.split('\n');
+    const lines=[];
+    rawLines.forEach(rl=>{
+      if(rl.length<=maxC){lines.push(rl);return;}
+      const words=rl.split(' ');let cur='';
+      words.forEach(w=>{const t=cur?cur+' '+w:w;if(t.length>maxC&&cur){lines.push(cur);cur=w;}else cur=t;});
+      if(cur)lines.push(cur);
+    });
+    const lh=fs+2;
+    const startY=p.y-(lines.length-1)*lh/2;
+    lines.forEach((ln,i)=>{
+      svg+=`<text x="${p.x}" y="${startY+i*lh}" text-anchor="middle" dominant-baseline="central" font-size="${fs}" font-weight="${fw}" fill="${palette.t}">${esc(ln)}</text>`;
+    });
+  });
+
+  svg+=`</svg>`;
+  return{svg,width:W,height:H};
 }
 function bz(x1,y1,x2,y2,c,w){const mx=(x1+x2)/2;return`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" fill="none" stroke="${c}" stroke-width="${w}" opacity="0.45"/>`;}
 function rbox(cx,cy,w,h,r,fill,stroke,label,tc,fs,fw){

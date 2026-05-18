@@ -1,6 +1,6 @@
 {
   "name": "suite-academica-moodle",
-  "version": "8.1.0",
+  "version": "9.0.0",
   "description": "Suite académica con autenticación, integración Moodle 5, preguntas test con polaridad, resúmenes, mapas, maquetación con plantillas de color, historial por usuario y soporte de PDFs grandes",
   "main": "server.js",
   "scripts": {

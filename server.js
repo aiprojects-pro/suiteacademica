@@ -314,7 +314,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 });
 
 app.get('/api/health', (_req, res) => res.json({
-  status:'ok', model:MODEL, version:'8.1.0', users:loadUsers().length,
+  status:'ok', model:MODEL, version:'9.0.0', users:loadUsers().length,
   limits: { maqChunk:MAQ_CHUNK, maqSingle:MAQ_SINGLE, historyLimit:HISTORY_LIMIT }
 }));
 
@@ -1334,29 +1334,83 @@ app.post('/api/summary-docx', async (req,res) => {
   }
 });
 
-// ── POST /api/map — mapa conceptual ───────────────────────────────────────────
+// ── POST /api/map — mapa conceptual (radial + Novak) ──────────────────────────
 app.post('/api/map', async (req, res) => {
-  const { topicId, depth } = req.body;
+  const { topicId, depth, style } = req.body;
   const topic = topicCache.get(topicId);
   if (!topic) return res.status(404).json({ error:'Tema no encontrado.' });
-  const dm = {
-    simple:    '4-5 ramas · 2-3 subnodos',
-    completo:  '6-7 ramas · 3-4 subnodos',
-    detallado: '7-8 ramas · 4-5 subnodos'
-  };
-  const prompt = `Analiza el documento y genera un mapa conceptual. Devuelve ÚNICAMENTE JSON válido:
+  const mapStyle = style === 'novak' ? 'novak' : 'radial';
+
+  // ── Estilo radial (centro → ramas → subnodos) ────────────────────────────
+  if (mapStyle === 'radial') {
+    const dm = {
+      simple:    '4-5 ramas · 2-3 subnodos',
+      completo:  '6-7 ramas · 3-4 subnodos',
+      detallado: '7-8 ramas · 4-5 subnodos'
+    };
+    const prompt = `Analiza el documento y genera un mapa conceptual radial. Devuelve ÚNICAMENTE JSON válido:
 {"title":"Título (máx 4 palabras)","branches":[{"label":"Concepto (2-4 palabras)","nodes":["Subconcepto"]}]}
 Estructura: ${dm[depth] || dm.completo}`;
+    try {
+      let raw = await callClaude(makeMessages(prompt, topic), 4000);
+      raw = raw.replace(/```json|```/g,'').trim();
+      const s = raw.indexOf('{'), e = raw.lastIndexOf('}') + 1;
+      if (s >= 0) raw = raw.substring(s, e);
+      const data = JSON.parse(raw);
+      if (!data.title || !data.branches?.length) throw new Error('JSON inválido');
+      return res.json({ success:true, style:'radial', data });
+    } catch(err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── Estilo Novak (conceptos + frases de enlace + cross-links) ────────────
+  const dm = {
+    simple:    '2 macroconceptos en nivel 0 · 1 nivel de subconceptos · ~8-10 conceptos en total · ~7-9 proposiciones',
+    completo:  '3-4 macroconceptos en nivel 0 · 2 niveles de subconceptos · ~14-18 conceptos en total · ~16-22 proposiciones · 1-2 cross-links entre ramas distintas',
+    detallado: '4-5 macroconceptos en nivel 0 · 2-3 niveles de subconceptos · ~22-28 conceptos en total · ~26-32 proposiciones · 3-4 cross-links entre ramas distintas'
+  };
+  const prompt = `Analiza el documento y genera un MAPA CONCEPTUAL DE NOVAK (NO un mapa radial ni una lista jerárquica). Devuelve ÚNICAMENTE JSON válido con esta estructura exacta:
+{
+  "title": "Título general del mapa (máx 5 palabras)",
+  "concepts": [
+    {"id":"c1","text":"NOMBRE DEL MACROCONCEPTO","level":0},
+    {"id":"c2","text":"Subconcepto","level":1},
+    {"id":"c3","text":"Subnodo específico","level":2}
+  ],
+  "propositions": [
+    {"from":"c1","phrase":"exige conocer","to":"c2"},
+    {"from":"c2","phrase":"se concreta en","to":"c3"}
+  ]
+}
+
+REGLAS OBLIGATORIAS:
+1. Cada proposición (arista) DEBE llevar una FRASE DE ENLACE significativa: verbos o expresiones conectoras como "exige conocer", "se aplica a", "se lleva a cabo a través de", "se concibe como", "incluye", "depende de", "en donde debe constatarse", "se complementa con", "debemos trabajar en base a", "se define por", "se concreta en", "se traduce en", "está formado por", "responde a", "tiene como objetivo". NUNCA uses frases vacías, "es", "tiene", "de", "y", ni inventes "rama" o "subnodo".
+2. Las tripletas (concepto A — frase — concepto B) deben leerse como ORACIONES con sentido en castellano.
+3. Conceptos de NIVEL 0 = MACROCONCEPTOS o temas principales del documento (texto en MAYÚSCULAS, 3-6 palabras). Conecta los macroconceptos entre sí cuando exista relación (cross-link de nivel 0 a nivel 0).
+4. Conceptos de NIVEL 1 = subtemas inmediatos (capitalización normal, 2-4 palabras).
+5. Conceptos de NIVEL 2 = subnodos finales (1-3 palabras).
+6. Permite cross-links: que un mismo concepto reciba flechas de varios padres, o que conceptos de distintas ramas se conecten entre sí (es lo que distingue un mapa Novak de un árbol).
+7. Los IDs son únicos (c1, c2, c3…) y todas las proposiciones referencian conceptos que existan en el array "concepts".
+8. Cuando un MISMO concepto origen conecte con varios destinos a través de la MISMA frase de enlace, repite la frase tal cual en cada proposición (el render las agrupa automáticamente).
+9. Fuente: EXCLUSIVAMENTE el contenido del documento proporcionado.
+
+ESTRUCTURA OBJETIVO: ${dm[depth] || dm.completo}`;
   try {
-    let raw = await callClaude(makeMessages(prompt, topic), 4000);
+    let raw = await callClaude(makeMessages(prompt, topic), 8000);
     raw = raw.replace(/```json|```/g,'').trim();
     const s = raw.indexOf('{'), e = raw.lastIndexOf('}') + 1;
     if (s >= 0) raw = raw.substring(s, e);
     const data = JSON.parse(raw);
-    if (!data.title || !data.branches?.length) throw new Error('JSON inválido');
-    res.json({ success:true, data });
+    if (!data.title || !Array.isArray(data.concepts) || !Array.isArray(data.propositions)) throw new Error('JSON inválido: faltan concepts o propositions');
+    if (!data.concepts.length) throw new Error('Sin conceptos');
+    // Validar referencias: descartar proposiciones rotas o reflexivas
+    const ids = new Set(data.concepts.map(c => c.id));
+    data.propositions = data.propositions.filter(p => p && p.from && p.to && ids.has(p.from) && ids.has(p.to) && p.from !== p.to);
+    if (!data.propositions.length) throw new Error('Sin proposiciones válidas');
+    return res.json({ success:true, style:'novak', data });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -1980,7 +2034,7 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 // ── Arranque ──────────────────────────────────────────────────────────────────
 initUsers().then(() => {
   app.listen(PORT, HOST, () => {
-    console.log(`\n✅  Suite Académica Moodle · v8.1`);
+    console.log(`\n✅  Suite Académica Moodle · v9.0`);
     console.log(`   URL    : http://${HOST==='0.0.0.0'?'localhost':HOST}:${PORT}`);
     console.log(`   Modelo : ${MODEL}`);
     console.log(`   Usuarios: ${loadUsers().length} registrados`);
