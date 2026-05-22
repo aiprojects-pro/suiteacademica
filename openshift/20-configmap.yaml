@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────────────────────────────
+#  ConfigMap con variables NO sensibles (limites, flags, timeouts).
+#  Las claves van como variables de entorno al pod (ver Deployment).
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: suiteacademica-config
+  namespace: suiteacademica
+data:
+  # Servidor
+  NODE_ENV: "production"
+  HOST: "0.0.0.0"
+  PORT: "3000"
+  HTTPS: "true"
+
+  # Persistencia (montaje del PVC)
+  DATA_DIR: "/app/data"
+
+  # Admin inicial: NO definimos ADMIN_PASS → el sistema genera una aleatoria
+  ADMIN_USER: "admin"
+
+  # 2FA obligatorio para administradores
+  REQUIRE_TOTP_FOR_ADMINS: "true"
+
+  # Modelo y límites de uso
+  ANTHROPIC_MODEL: "claude-sonnet-4-6"
+  MAX_FILE_MB: "50"
+  MAX_TOPICS: "100"
+  SESSION_HOURS: "8"
+
+  # Maquetación (defaults seguros tras los fixes de F7)
+  MAQ_SINGLE_CHARS: "18000"
+  MAQ_CHUNK_CHARS: "18000"
+  MAQ_MAX_TOKENS: "32000"
+  MAQ_CONCURRENCY: "3"
+
+  # Monitoring y auditoría
+  MONITOR_THRESHOLD: "20"
+  MONITOR_WINDOW_MS: "300000"
+  AUDIT_MAX_BYTES: "5242880"
+
+  # Worker de parsing (memoria + timeout)
+  PARSE_TIMEOUT_MS: "30000"
+  PARSE_MEM_LIMIT_MB: "512"
+  USER_TOPIC_BUDGET_MB: "250"

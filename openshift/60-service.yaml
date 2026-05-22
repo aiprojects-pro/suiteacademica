@@ -1,0 +1,17 @@
+# Service ClusterIP — punto de entrada interno para la Route.
+apiVersion: v1
+kind: Service
+metadata:
+  name: suiteacademica
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+spec:
+  type: ClusterIP
+  selector:
+    app: suiteacademica
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80         # puerto del Service
+      targetPort: http # puerto del container (3000)

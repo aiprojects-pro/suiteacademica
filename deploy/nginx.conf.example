@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────
+#  Configuración nginx de ejemplo para Suite Académica Moodle.
+#
+#  - Termina TLS con Let's Encrypt (certbot) o cert corporativo.
+#  - Reenvía a Node (127.0.0.1:3000) que escucha sólo en loopback.
+#  - Soporta SSE (Server-Sent Events) — desactivamos buffering.
+#  - Tamaño máximo de body coherente con MAX_FILE_MB del servidor.
+#
+#  Sustituye `suiteacademica.example.com` por tu dominio real.
+# ─────────────────────────────────────────────────────────────────────
+
+# Redirección HTTP → HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name suiteacademica.example.com;
+    return 301 https://$host$request_uri;
+}
+
+# Servidor HTTPS
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name suiteacademica.example.com;
+
+    # === Certificados (Let's Encrypt vía certbot) ===
+    ssl_certificate     /etc/letsencrypt/live/suiteacademica.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/suiteacademica.example.com/privkey.pem;
+
+    # TLS moderno (TLS 1.2+, sin ciphers débiles)
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # HSTS — sólo activar tras confirmar que todo funciona por HTTPS.
+    # add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # === Tamaño máximo de body ===
+    # Debe ser >= MAX_FILE_MB de Suite Académica. Si MAX_FILE_MB=50 → 60M por seguridad.
+    client_max_body_size 60m;
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+
+    # === Buffers ===
+    # SSE necesita buffering off; lo aplicamos en la location.
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    # === Logs ===
+    access_log /var/log/nginx/suiteacademica.access.log;
+    error_log  /var/log/nginx/suiteacademica.error.log warn;
+
+    # === Proxy al backend Node ===
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+
+        # Headers para que Express vea la conexión original
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+
+        # SSE y subidas largas — sin buffering, timeouts amplios
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+
+        # Cabeceras de WebSocket no necesarias (no las usa la app), pero no estorban
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "";
+    }
+
+    # Bloquear acceso directo a ficheros sensibles si por error quedaran expuestos
+    location ~ /\.(?:env|git|claude) {
+        deny all;
+        return 404;
+    }
+    location ~ /(data|deploy|workers|node_modules)/ {
+        deny all;
+        return 404;
+    }
+}

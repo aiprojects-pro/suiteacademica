@@ -1,0 +1,98 @@
+# ─────────────────────────────────────────────────────────────────────
+#  CronJob de backup: cada día a las 03:00 UTC crea un tar.gz con todo
+#  data/ en el PVC de backups. Conserva los últimos 14 días y elimina los
+#  más antiguos.
+#
+#  El backup se llama: backup-YYYYMMDD-HHMMSS.tar.gz
+#
+#  Recuperación: `oc rsh` al pod del CronJob (o cualquier pod con el PVC),
+#  extraer el tar y copiar archivos al PVC de datos. Ver INSTALL-OKD.md.
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: suiteacademica-backup
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+    role: backup
+spec:
+  schedule: "0 3 * * *"           # 03:00 UTC todos los días
+  timeZone: "Europe/Madrid"       # cambiar si tu zona es otra
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800   # como mucho 30 min por backup
+      template:
+        metadata:
+          labels:
+            app: suiteacademica
+            role: backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              # Imagen UBI minimal con tar + gzip; sin shell-bashisms para no fallar.
+              image: registry.access.redhat.com/ubi9-minimal:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  TS=$(date -u +%Y%m%d-%H%M%S)
+                  OUT="/backups/backup-${TS}.tar.gz"
+                  echo "[backup] iniciando: ${OUT}"
+                  # tar excluye sessions (es regenerable y SQLite puede estar abierto)
+                  cd /data
+                  tar -czf "${OUT}" \
+                    --exclude='./sessions' \
+                    --exclude='./ADMIN_INITIAL_PASSWORD.txt' \
+                    . 2>/dev/null || tar -czf "${OUT}" --exclude='./sessions' .
+                  chmod 0600 "${OUT}"
+                  echo "[backup] tamaño: $(du -h ${OUT} | cut -f1)"
+                  # Rotación: conservar los 14 más recientes
+                  ls -1t /backups/backup-*.tar.gz 2>/dev/null | tail -n +15 | xargs -r rm -f
+                  echo "[backup] backups conservados:"
+                  ls -lh /backups/backup-*.tar.gz 2>/dev/null | awk '{print "  "$9, $5}'
+                  echo "[backup] OK"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "1"
+                  memory: "512Mi"
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: suiteacademica-data
+                readOnly: true
+            - name: backups
+              persistentVolumeClaim:
+                claimName: suiteacademica-backups
+            - name: tmp
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Mi

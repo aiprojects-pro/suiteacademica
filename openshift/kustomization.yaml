@@ -1,0 +1,23 @@
+# Aplicar TODO con: oc apply -k openshift/
+# (el Secret hay que crearlo APARTE; este kustomization NO lo incluye).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: suiteacademica
+
+resources:
+  - 00-namespace.yaml
+  - 20-configmap.yaml
+  - 30-pvc-data.yaml
+  - 31-pvc-backups.yaml
+  - 40-buildconfig.yaml
+  - 50-deployment.yaml
+  - 60-service.yaml
+  - 70-route.yaml
+  - 80-networkpolicy.yaml
+  - 90-backup-cronjob.yaml
+
+commonLabels:
+  app: suiteacademica
+  app.kubernetes.io/name: suiteacademica
+  app.kubernetes.io/managed-by: kustomize

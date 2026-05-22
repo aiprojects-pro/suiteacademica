@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────
+#  Route con TLS edge termination.
+#  El cluster proporciona el certificado (wildcard *.apps.<cluster>.<domain>).
+#
+#  CAMBIA `host:` por el FQDN real que quieras (o déjalo vacío y OKD
+#  asignará uno autogenerado del wildcard de apps).
+#
+#  insecureEdgeTerminationPolicy: Redirect → HTTP→HTTPS automático.
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: suiteacademica
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+  annotations:
+    # SSE necesita timeout largo en el router HAProxy del cluster
+    haproxy.router.openshift.io/timeout: "10m"
+    # No bufferizar respuestas (para que el SSE llegue en streaming)
+    haproxy.router.openshift.io/balance: "leastconn"
+spec:
+  # host: suiteacademica.apps.<cluster>.<domain>   ← descomenta y ajusta si quieres FQDN específico
+  to:
+    kind: Service
+    name: suiteacademica
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

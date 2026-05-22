@@ -1,16 +1,68 @@
 require('dotenv').config();
 const express   = require('express');
 const session   = require('express-session');
-const FileStore = require('session-file-store')(session);
-const bcrypt    = require('bcryptjs');
+const SqliteStore = require('better-sqlite3-session-store')(session);
+const Database  = require('better-sqlite3');
+const bcrypt    = require('bcrypt');
 const multer    = require('multer');
-const mammoth   = require('mammoth');
-const pdfParse  = require('pdf-parse');
+// mammoth y unpdf se cargan en el worker (workers/parser-worker.js), NO en el proceso
+// principal: parsear documentos en el main puede tumbar el event loop con un PDF
+// malicioso o agotar memoria.
 const Anthropic = require('@anthropic-ai/sdk');
 const JSZip     = require('jszip');
 const { v4: uuidv4 } = require('uuid');
 const path      = require('path');
 const fs        = require('fs');
+const crypto    = require('crypto');
+const helmet    = require('helmet');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const dns       = require('dns').promises;
+const net       = require('net');
+const { Worker } = require('worker_threads');
+const otplib = require('otplib');
+const QRCode = require('qrcode');
+
+// otplib v13 expone funciones top-level: generateSecret, generateURI, verify (async).
+// verify() devuelve { valid: boolean, ... } — NO un booleano. Extraemos .valid explícitamente.
+// Tolerancia de ±1 step para evitar problemas de reloj entre cliente y servidor.
+async function totpVerify(token, secret) {
+  try {
+    const r = await otplib.verify({ token, secret, window: 1 });
+    return !!(r && r.valid);
+  } catch (_) { return false; }
+}
+function totpGenerateSecret() { return otplib.generateSecret(); }
+function totpUri(account, issuer, secret) { return otplib.generateURI({ account, issuer, secret }); }
+
+// Backup codes: 10 códigos de un solo uso, formato XXXX-XXXX (8 chars alfanuméricos en mayúsculas).
+// Se devuelven en texto plano UNA vez al activar 2FA; en disco sólo guardamos hashes bcrypt.
+function generateBackupCodes(n = 10) {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin 0/O/1/I para evitar confusión
+  const codes = [];
+  for (let i = 0; i < n; i++) {
+    const bytes = crypto.randomBytes(8);
+    let raw = '';
+    for (const b of bytes) raw += alphabet[b % alphabet.length];
+    codes.push(raw.slice(0, 4) + '-' + raw.slice(4));
+  }
+  return codes;
+}
+async function hashBackupCodes(codes) {
+  return Promise.all(codes.map(c => bcrypt.hash(c, 10)));
+}
+// Devuelve el índice del backup code que coincide, o -1.
+async function findMatchingBackupCode(code, hashes) {
+  if (!Array.isArray(hashes) || !hashes.length) return -1;
+  const normalized = String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (normalized.length !== 8) return -1;
+  const formatted = normalized.slice(0, 4) + '-' + normalized.slice(4);
+  for (let i = 0; i < hashes.length; i++) {
+    try {
+      if (await bcrypt.compare(formatted, hashes[i])) return i;
+    } catch (_) {}
+  }
+  return -1;
+}
 
 const {
   Document, Packer, Paragraph, TextRun, ImageRun, HeadingLevel,
@@ -26,44 +78,135 @@ if (MISSING.length) {
   process.exit(1);
 }
 
+// Rechazar SESSION_SECRET débil o el placeholder del .env.example
+const WEAK_SECRETS = new Set([
+  'cambia-esto-por-una-cadena-aleatoria-larga-y-segura',
+  'changeme', 'secret', 'session-secret'
+]);
+if (process.env.SESSION_SECRET.length < 32 || WEAK_SECRETS.has(process.env.SESSION_SECRET)) {
+  console.error('\n❌  SESSION_SECRET es demasiado débil o es el placeholder por defecto.');
+  console.error('    Debe tener al menos 32 caracteres aleatorios. Genera uno con:');
+  console.error('    node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'base64\'))"\n');
+  process.exit(1);
+}
+
 // ── Configuración ─────────────────────────────────────────────────────────────
 const app  = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT  || 3000;
-const HOST = process.env.HOST  || '0.0.0.0';
+const HOST = process.env.HOST  || '127.0.0.1';
 const MODEL       = process.env.ANTHROPIC_MODEL  || 'claude-sonnet-4-6';
 const MAX_TOPICS  = parseInt(process.env.MAX_TOPICS  || '100');
 const MAX_FILE_MB = parseInt(process.env.MAX_FILE_MB || '50');
 const BATCH_SIZE  = parseInt(process.env.BATCH_SIZE  || '25');
 const MAX_CHARS   = parseInt(process.env.MAX_CHARS   || '12000');
-const MAQ_CHUNK   = parseInt(process.env.MAQ_CHUNK_CHARS || '25000'); // tamaño de chunk para maquetación
+const MAQ_CHUNK   = parseInt(process.env.MAQ_CHUNK_CHARS || '18000'); // tamaño de chunk para maquetación
 const MAQ_SINGLE  = parseInt(process.env.MAQ_SINGLE_CHARS || '18000'); // umbral para llamada única
+const MAQ_MAX_TOKENS = parseInt(process.env.MAQ_MAX_TOKENS || '32000'); // max_tokens para la maquetación (literal puede ser largo)
 const CACHE_TTL   = parseInt(process.env.CACHE_TTL_H || '4') * 3600000;
 const SESSION_MS  = parseInt(process.env.SESSION_HOURS || '8') * 3600000;
 const HISTORY_LIMIT = parseInt(process.env.HISTORY_LIMIT || '200');
+const REQUIRE_TOTP_FOR_ADMINS = process.env.REQUIRE_TOTP_FOR_ADMINS === 'true';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ── Almacenamiento (users + historial + plantillas) ────────────────────────────
-const DATA_DIR        = path.join(__dirname, 'data');
+// DATA_DIR configurable por env (p.ej. en OKD el PVC se monta en /app/data o /data)
+const DATA_DIR        = process.env.DATA_DIR || path.join(__dirname, 'data');
 const USERS_FILE      = path.join(DATA_DIR, 'users.json');
 const HISTORY_DIR     = path.join(DATA_DIR, 'history');
 const TEMPLATES_DIR   = path.join(DATA_DIR, 'templates');
 const SESSIONS_DIR    = path.join(DATA_DIR, 'sessions');
-if (!fs.existsSync(DATA_DIR))      fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(HISTORY_DIR))   fs.mkdirSync(HISTORY_DIR, { recursive: true });
-if (!fs.existsSync(TEMPLATES_DIR)) fs.mkdirSync(TEMPLATES_DIR, { recursive: true });
-if (!fs.existsSync(SESSIONS_DIR))  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+function ensurePrivateDir(p) {
+  try {
+    if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    // En entornos containerizados (OKD/OpenShift) el volumen montado puede tener
+    // un propietario distinto; si no podemos crear, asumimos que ya existe vía PVC.
+    if (!fs.existsSync(p)) throw e;
+  }
+  // chmod tolerante: en OKD el PVC puede tener fsGroup y no podemos modificar permisos.
+  try { fs.chmodSync(p, 0o700); } catch(_) {}
+}
+ensurePrivateDir(DATA_DIR);
+ensurePrivateDir(HISTORY_DIR);
+ensurePrivateDir(TEMPLATES_DIR);
+ensurePrivateDir(SESSIONS_DIR);
+
+// Escritura atómica con permisos restrictivos (0600).
+function writePrivateJson(file, data) {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(tmp, 0o600); } catch(_) {}
+  fs.renameSync(tmp, file);
+}
 
 function loadUsers() {
   try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch(_) { return []; }
 }
 function saveUsers(users) {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  writePrivateJson(USERS_FILE, users);
 }
+// Búsqueda consistente: por id o por username (siempre comparando con username.toLowerCase()).
 function findUser(idOrUsername) {
+  if (typeof idOrUsername !== 'string') return null;
+  const needle = idOrUsername.toLowerCase();
   const users = loadUsers();
-  return users.find(u => u.id === idOrUsername || u.username === idOrUsername) || null;
+  return users.find(u => u.id === idOrUsername || (u.username && u.username.toLowerCase() === needle)) || null;
+}
+
+// ── Log de auditoría (JSON-line append-only con rotación simple) ──────────────
+const AUDIT_FILE = path.join(DATA_DIR, 'audit.log');
+const AUDIT_MAX_BYTES = parseInt(process.env.AUDIT_MAX_BYTES || (5 * 1024 * 1024));
+function rotateAuditIfNeeded() {
+  try {
+    const st = fs.statSync(AUDIT_FILE);
+    if (st.size < AUDIT_MAX_BYTES) return;
+    const rotated = AUDIT_FILE + '.1';
+    try { fs.unlinkSync(rotated); } catch(_) {}
+    fs.renameSync(AUDIT_FILE, rotated);
+    try { fs.chmodSync(rotated, 0o600); } catch(_) {}
+  } catch(_) { /* fichero no existe o no rotable */ }
+}
+
+// Monitoring en memoria de eventos sensibles para alertar si se concentran.
+// Ventana deslizante simple: array de timestamps, descartamos los antiguos al añadir.
+const SENSITIVE_EVENTS = new Set(['login_fail', 'login_locked', 'login_totp_fail']);
+const MONITOR_WINDOW_MS = parseInt(process.env.MONITOR_WINDOW_MS || (5 * 60 * 1000)); // 5 min
+const MONITOR_THRESHOLD = parseInt(process.env.MONITOR_THRESHOLD || '20');
+const monitorBuffer = [];
+let lastMonitorAlert = 0;
+function monitorEvent(event) {
+  if (!SENSITIVE_EVENTS.has(event)) return;
+  const now = Date.now();
+  monitorBuffer.push(now);
+  // Descartar timestamps fuera de ventana
+  while (monitorBuffer.length && monitorBuffer[0] < now - MONITOR_WINDOW_MS) monitorBuffer.shift();
+  if (monitorBuffer.length >= MONITOR_THRESHOLD && (now - lastMonitorAlert) > MONITOR_WINDOW_MS) {
+    lastMonitorAlert = now;
+    console.warn(`\n⚠  [SECURITY] ${monitorBuffer.length} eventos sensibles en los últimos ${Math.round(MONITOR_WINDOW_MS/60000)} min — posible ataque. Revisa data/audit.log\n`);
+  }
+}
+
+function audit(event, req, extra = {}) {
+  try {
+    rotateAuditIfNeeded();
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      event,
+      ip: (req && (req.ip || req.connection?.remoteAddress)) || null,
+      ua: req?.headers?.['user-agent']?.substring(0, 200) || null,
+      actor: req?.user?.username || req?.session?.userId || null,
+      ...extra
+    }) + '\n';
+    fs.appendFileSync(AUDIT_FILE, line, { mode: 0o600 });
+    // Asegurar permisos (sólo cambia si el fichero existía con permisos laxos)
+    try { fs.chmodSync(AUDIT_FILE, 0o600); } catch(_) {}
+  } catch(e) {
+    // No queremos que un fallo de logging tumbe la app
+    console.warn('[audit] error:', e.message);
+  }
+  monitorEvent(event);
 }
 
 // ── Historial por usuario ─────────────────────────────────────────────────────
@@ -72,7 +215,7 @@ function loadHistory(uid){
   try { return JSON.parse(fs.readFileSync(historyPath(uid), 'utf8')); } catch(_) { return []; }
 }
 function saveHistory(uid, list){
-  fs.writeFileSync(historyPath(uid), JSON.stringify(list, null, 2));
+  writePrivateJson(historyPath(uid), list);
 }
 function addHistoryEntry(uid, entry){
   const list = loadHistory(uid);
@@ -90,7 +233,7 @@ function loadTemplates(uid){
   try { return JSON.parse(fs.readFileSync(templatesPath(uid), 'utf8')); } catch(_) { return null; }
 }
 function saveTemplates(uid, list){
-  fs.writeFileSync(templatesPath(uid), JSON.stringify(list, null, 2));
+  writePrivateJson(templatesPath(uid), list);
 }
 
 // Plantillas por defecto si el usuario no tiene ninguna
@@ -131,8 +274,11 @@ function getUserTemplates(uid){
 async function initUsers() {
   const users = loadUsers();
   if (users.length === 0) {
-    const adminUser = process.env.ADMIN_USER || 'admin';
-    const adminPass = process.env.ADMIN_PASS || 'Admin1234!';
+    const adminUser = (process.env.ADMIN_USER || 'admin').toLowerCase();
+    // Si no se define ADMIN_PASS se genera una aleatoria de 24 bytes (32 chars base64url).
+    // En cualquier caso, se exige cambio en el primer login y NUNCA se imprime en stdout.
+    const adminPassGenerated = !process.env.ADMIN_PASS;
+    const adminPass = process.env.ADMIN_PASS || crypto.randomBytes(24).toString('base64url');
     const hash = await bcrypt.hash(adminPass, 12);
     saveUsers([{
       id:        uuidv4(),
@@ -141,37 +287,258 @@ async function initUsers() {
       password:  hash,
       role:      'admin',
       active:    true,
+      mustChangePassword: true,
       createdAt: new Date().toISOString(),
       lastLogin: null
     }]);
-    console.log(`\n🔑  Usuario administrador creado:`);
-    console.log(`     Usuario    : ${adminUser}`);
-    console.log(`     Contraseña : ${adminPass}`);
-    console.log(`     ⚠  Cambia la contraseña desde el panel de usuarios tras el primer login.\n`);
+    if (adminPassGenerated) {
+      // Sólo cuando NO se ha proporcionado ADMIN_PASS escribimos la contraseña a un
+      // fichero con permisos 600 que el operador debe leer una sola vez y borrar.
+      const onceFile = path.join(DATA_DIR, 'ADMIN_INITIAL_PASSWORD.txt');
+      fs.writeFileSync(onceFile, adminPass + '\n', { mode: 0o600 });
+      try { fs.chmodSync(onceFile, 0o600); } catch(_) {}
+      console.log(`\n🔑  Usuario administrador creado: ${adminUser}`);
+      console.log(`     Contraseña inicial en: ${onceFile}`);
+      console.log(`     ⚠  El sistema EXIGE cambiarla en el primer login. Borra el fichero después.\n`);
+    } else {
+      console.log(`\n🔑  Usuario administrador creado: ${adminUser}`);
+      console.log(`     ⚠  El sistema EXIGE cambio de contraseña en el primer login.\n`);
+    }
   }
 }
 
-// ── Cache de temas ─────────────────────────────────────────────────────────────
+// ── Cache de temas (aislado por userId + cuota por usuario) ───────────────────
 const topicCache = new Map();
+const USER_TOPIC_BUDGET_BYTES = parseInt(process.env.USER_TOPIC_BUDGET_MB || '250') * 1024 * 1024;
+
+// Estima el tamaño en bytes que ocupa un topic en memoria (aproximado).
+function estimateTopicBytes(topic) {
+  let n = 0;
+  if (topic.base64)  n += topic.base64.length;
+  if (topic.text)    n += topic.text.length * 2; // UTF-16 en V8
+  if (Array.isArray(topic.images)) for (const im of topic.images) n += im.data?.length || 0;
+  if (Array.isArray(topic.tables)) for (const tb of topic.tables) n += JSON.stringify(tb).length;
+  return n;
+}
+
+// Inserta un topic en el cache asociado al usuario, expulsando los más antiguos del MISMO usuario
+// si supera la cuota. Nunca toca topics de otros usuarios.
+function addToTopicCache(userId, id, topic) {
+  const bytes = estimateTopicBytes(topic);
+  topicCache.set(id, { ...topic, ts: Date.now(), userId, bytes });
+  let total = 0;
+  const owned = [];
+  for (const [tid, t] of topicCache) {
+    if (t.userId === userId) { total += t.bytes || 0; owned.push([tid, t]); }
+  }
+  if (total <= USER_TOPIC_BUDGET_BYTES) return;
+  owned.sort((a, b) => a[1].ts - b[1].ts); // más antiguo primero
+  for (const [tid, t] of owned) {
+    if (total <= USER_TOPIC_BUDGET_BYTES) break;
+    if (tid === id) continue; // no expulsar el recién añadido
+    topicCache.delete(tid);
+    total -= t.bytes || 0;
+  }
+}
+
 setInterval(() => { const n=Date.now(); for(const[id,e] of topicCache) if(n-e.ts>CACHE_TTL) topicCache.delete(id); }, 3600000);
 
+// Devuelve el topic SOLO si pertenece al usuario que hace la petición.
+function getOwnedTopic(req, id) {
+  if (typeof id !== 'string' || id.length < 8) return null;
+  const t = topicCache.get(id);
+  if (!t) return null;
+  if (t.userId !== req.user?.id) return null;
+  return t;
+}
+
 // ── Middleware ────────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Helmet con CSP estricta:
+// - script-src 'self' (sin unsafe-inline) → bloquea <script>inyectado</script>.
+// - script-src-attr 'unsafe-inline' → permite los onclick="..." legítimos del HTML.
+//   (Mitigación parcial: cualquier inyección de etiqueta <script> sigue bloqueada.)
+// - style-src 'self' 'unsafe-inline' → estilos inline siguen permitidos (riesgo bajo).
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc:     ["'self'"],
+      scriptSrc:      ["'self'"],
+      scriptSrcAttr:  ["'unsafe-inline'"],
+      styleSrc:       ["'self'", "'unsafe-inline'"],
+      imgSrc:         ["'self'", 'data:', 'blob:'],
+      connectSrc:     ["'self'"],
+      fontSrc:        ["'self'", 'data:'],
+      objectSrc:      ["'none'"],
+      frameAncestors: ["'self'"],
+      baseUri:        ["'self'"],
+      formAction:     ["'self'"]
+    }
+  },
+  crossOriginEmbedderPolicy: false,
+  hsts: process.env.HTTPS === 'true' ? undefined : false
+}));
+// Bodies pequeños por defecto. Los uploads grandes van por multer y NO usan estos parsers.
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+// SQLite session store (más robusto bajo concurrencia que ficheros sueltos).
+// La base se crea con permisos 0600 vía writePrivateJson-like wrapping de fs.chmodSync.
+const SESSION_DB = path.join(SESSIONS_DIR, 'sessions.sqlite');
+const sessionDb = new Database(SESSION_DB);
+try { fs.chmodSync(SESSION_DB, 0o600); } catch(_) {}
 app.use(session({
-  store:             new FileStore({ path: SESSIONS_DIR, ttl: Math.floor(SESSION_MS / 1000), retries: 0 }),
+  name:              'sid',
+  store:             new SqliteStore({
+    client: sessionDb,
+    expired: { clear: true, intervalMs: 15 * 60 * 1000 }
+  }),
   secret:            process.env.SESSION_SECRET,
   resave:            false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
+    sameSite: 'strict',
     secure:   process.env.NODE_ENV === 'production' && process.env.HTTPS === 'true',
     maxAge:   SESSION_MS
   }
 }));
-app.use((_req,res,next) => { res.setHeader('X-Content-Type-Options','nosniff'); res.setHeader('X-Frame-Options','SAMEORIGIN'); next(); });
+
+// Redirección HTTP→HTTPS si HTTPS=true y hay reverse proxy
+if (process.env.HTTPS === 'true') {
+  app.use((req, res, next) => {
+    if (req.secure || req.headers['x-forwarded-proto'] === 'https') return next();
+    if (req.method !== 'GET' && req.method !== 'HEAD') return res.status(403).json({ error: 'HTTPS requerido.' });
+    return res.redirect(308, 'https://' + req.headers.host + req.originalUrl);
+  });
+}
+
+// ── CSRF doble-submit ─────────────────────────────────────────────────────────
+// El servidor emite cookie 'csrf' (no httpOnly, sameSite:strict) con un token aleatorio.
+// El frontend lee la cookie y la envía en cabecera 'X-CSRF-Token' en cada mutación.
+// El servidor compara cookie == header con timingSafeEqual.
+const CSRF_COOKIE_OPTS = {
+  httpOnly: false,            // el JS necesita leerla
+  sameSite: 'strict',
+  secure:   process.env.NODE_ENV === 'production' && process.env.HTTPS === 'true',
+  path:     '/'
+};
+function setCsrfCookieIfMissing(req, res) {
+  if (!req.cookies?.csrf && !readCookie(req, 'csrf')) {
+    const token = crypto.randomBytes(32).toString('base64url');
+    res.cookie('csrf', token, CSRF_COOKIE_OPTS);
+    // Para que el header de la primera mutación funcione, exponemos el token también vía cabecera de respuesta
+    res.setHeader('X-CSRF-Token', token);
+  }
+}
+function readCookie(req, name) {
+  const hdr = req.headers.cookie || '';
+  for (const part of hdr.split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return decodeURIComponent(v.join('='));
+  }
+  return null;
+}
+const SAFE_METHODS  = new Set(['GET','HEAD','OPTIONS']);
+const CSRF_EXEMPT   = new Set(['/api/auth/login']); // login no tiene sesión que confundir
+function csrfProtect(req, res, next) {
+  // Siempre asegura que la cookie esté establecida para futuras peticiones
+  setCsrfCookieIfMissing(req, res);
+  if (SAFE_METHODS.has(req.method) || CSRF_EXEMPT.has(req.path)) return next();
+  const cookieTok = readCookie(req, 'csrf');
+  const headerTok = req.headers['x-csrf-token'];
+  if (!cookieTok || !headerTok || cookieTok.length !== headerTok.length) {
+    return res.status(403).json({ error: 'CSRF token inválido o ausente.' });
+  }
+  try {
+    const a = Buffer.from(cookieTok);
+    const b = Buffer.from(headerTok);
+    if (!crypto.timingSafeEqual(a, b)) {
+      return res.status(403).json({ error: 'CSRF token inválido.' });
+    }
+  } catch(_) {
+    return res.status(403).json({ error: 'CSRF token inválido.' });
+  }
+  next();
+}
+app.use(csrfProtect);
+
+// ── Rate limiters ─────────────────────────────────────────────────────────────
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,                       // 10 intentos por IP cada 15 min
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiados intentos de inicio de sesión. Inténtalo más tarde.' }
+});
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,                      // 120 req/min global por IP en /api/*
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path.startsWith('/api/auth/login'),
+  message: { error: 'Demasiadas peticiones. Espera unos segundos.' }
+});
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,                       // 20 req/min por sesión a endpoints IA
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req, res) => req.session?.userId || ipKeyGenerator(req, res),
+  message: { error: 'Límite de uso de IA por minuto alcanzado. Espera un poco.' }
+});
+app.use('/api', apiLimiter);
+
+// Lockout por usuario tras varios fallos de login (en memoria + persistencia ligera)
+const LOGIN_FAIL_FILE  = path.join(DATA_DIR, 'login-fails.json');
+const LOCKOUT_THRESHOLD = 8;
+const LOCKOUT_MS        = 30 * 60 * 1000;
+function loadLoginFails() {
+  try { return JSON.parse(fs.readFileSync(LOGIN_FAIL_FILE, 'utf8')); } catch(_) { return {}; }
+}
+function saveLoginFails(o) {
+  try { fs.writeFileSync(LOGIN_FAIL_FILE, JSON.stringify(o), { mode: 0o600 }); } catch(_) {}
+}
+function recordLoginFail(username) {
+  const o = loadLoginFails();
+  const e = o[username] || { count: 0, lockUntil: 0 };
+  e.count += 1;
+  e.lastFail = Date.now();
+  if (e.count >= LOCKOUT_THRESHOLD) {
+    e.lockUntil = Date.now() + LOCKOUT_MS;
+    e.count = 0;
+  }
+  o[username] = e;
+  saveLoginFails(o);
+}
+function clearLoginFail(username) {
+  const o = loadLoginFails();
+  if (o[username]) { delete o[username]; saveLoginFails(o); }
+}
+function isLockedOut(username) {
+  const o = loadLoginFails();
+  const e = o[username];
+  return !!(e && e.lockUntil && e.lockUntil > Date.now());
+}
+
+app.use((_req,res,next) => { res.setHeader('Referrer-Policy','no-referrer'); next(); });
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
+// Rutas exentas del bloqueo por mustChangePassword (necesarias para poder cambiarla)
+const PASSWORD_GRACE_PATHS = new Set([
+  '/api/auth/me',
+  '/api/auth/logout',
+  '/api/auth/change-password'
+]);
+// Rutas exentas del bloqueo por TOTP obligatorio: las que necesita un admin para activarlo
+// y para cambiar su contraseña si está en el primer login.
+const TOTP_GRACE_PATHS = new Set([
+  '/api/auth/me',
+  '/api/auth/logout',
+  '/api/auth/change-password',
+  '/api/auth/totp/setup',
+  '/api/auth/totp/enable'
+]);
+
 function requireAuth(req, res, next) {
   if (!req.session.userId) {
     const isJson = req.headers['content-type']?.includes('json') || req.xhr;
@@ -181,10 +548,33 @@ function requireAuth(req, res, next) {
   }
   const user = findUser(req.session.userId);
   if (!user || !user.active) {
-    req.session.destroy(() => {});
+    req.session.destroy((err) => { if (err) console.warn('[session] destroy error:', err.message); });
     return res.redirect('/login?msg=session_expired');
   }
   req.user = user;
+  // Si el usuario debe cambiar la contraseña, sólo permitimos las rutas mínimas
+  if (user.mustChangePassword && !PASSWORD_GRACE_PATHS.has(req.path)) {
+    if (req.method === 'GET' && (
+      req.path === '/' ||
+      req.path === '/index.html' ||
+      req.path === '/app.js'
+    )) {
+      // Permitimos cargar el frontend para que muestre el formulario de cambio
+      return next();
+    }
+    return res.status(403).json({ error: 'Debes cambiar la contraseña antes de continuar.', mustChangePassword: true });
+  }
+  // Si REQUIRE_TOTP_FOR_ADMINS y es admin sin 2FA, sólo permitimos rutas para activarlo
+  if (REQUIRE_TOTP_FOR_ADMINS && user.role === 'admin' && !user.totpEnabled && !TOTP_GRACE_PATHS.has(req.path)) {
+    if (req.method === 'GET' && (
+      req.path === '/' ||
+      req.path === '/index.html' ||
+      req.path === '/app.js'
+    )) {
+      return next();
+    }
+    return res.status(403).json({ error: 'Como administrador debes activar 2FA antes de continuar.', mustEnable2FA: true });
+  }
   next();
 }
 
@@ -193,39 +583,193 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Hash bcrypt dummy con coste 12 para mantener tiempo constante cuando el usuario no existe
+const DUMMY_HASH = '$2a$12$CwTycUXWue0Thq9StjUM0uJ8R8t0H1NaaP6XQpQp5J3eRk4yQ7c0a';
+
 // ── Rutas de autenticación (sin protección) ────────────────────────────────────
 app.get('/login', (req, res) => {
   if (req.session.userId) return res.redirect('/');
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error:'Usuario y contraseña son obligatorios.' });
+// JS del login servido públicamente (necesario para que CSP estricta pueda cargarlo)
+app.get('/login.js', (_req, res) => {
+  res.type('application/javascript');
+  res.sendFile(path.join(__dirname, 'public', 'login.js'));
+});
 
-  const user = findUser(username.trim().toLowerCase()) || findUser(username.trim());
-  if (!user) return res.status(401).json({ error:'Usuario o contraseña incorrectos.' });
-  if (!user.active) return res.status(403).json({ error:'Esta cuenta está desactivada. Contacta con el administrador.' });
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const { username, password } = req.body || {};
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+    return res.status(400).json({ error:'Usuario y contraseña son obligatorios.' });
+  }
+  const uname = username.trim().toLowerCase();
 
-  const ok = await bcrypt.compare(password, user.password);
-  if (!ok) return res.status(401).json({ error:'Usuario o contraseña incorrectos.' });
+  // Lockout por cuenta
+  if (isLockedOut(uname)) {
+    audit('login_locked', req, { username: uname });
+    return res.status(429).json({ error:'Cuenta bloqueada temporalmente por demasiados intentos. Espera 30 minutos.' });
+  }
 
-  req.session.userId = user.id;
-  req.session.save(() => {
-    const users = loadUsers();
-    const idx = users.findIndex(u => u.id === user.id);
-    if (idx !== -1) { users[idx].lastLogin = new Date().toISOString(); saveUsers(users); }
-    res.json({ success:true, name:user.name, role:user.role, username:user.username });
+  const user = findUser(uname);
+  // Siempre ejecutar bcrypt.compare (contra hash dummy si no existe el usuario) para mitigar timing attacks
+  const hashToCheck = user?.password || DUMMY_HASH;
+  let ok = false;
+  try { ok = await bcrypt.compare(password, hashToCheck); } catch(_) { ok = false; }
+
+  if (!user || !ok) {
+    recordLoginFail(uname);
+    audit('login_fail', req, { username: uname, reason: user ? 'bad_password' : 'no_such_user' });
+    return res.status(401).json({ error:'Usuario o contraseña incorrectos.' });
+  }
+  if (!user.active) {
+    audit('login_fail', req, { username: uname, reason: 'disabled' });
+    return res.status(403).json({ error:'Esta cuenta está desactivada. Contacta con el administrador.' });
+  }
+
+  clearLoginFail(uname);
+
+  // Si el usuario tiene 2FA activado, NO iniciamos sesión todavía: pedimos el código TOTP.
+  // Guardamos el id pendiente en la sesión como `pendingUserId` (sin `userId` aún).
+  if (user.totpEnabled) {
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error('[auth] session.regenerate error:', err.message);
+        return res.status(500).json({ error:'Error iniciando sesión.' });
+      }
+      req.session.pendingUserId = user.id;
+      req.session.pendingSince  = Date.now();
+      // Token CSRF también necesario para el segundo paso
+      const csrfTok = crypto.randomBytes(32).toString('base64url');
+      res.cookie('csrf', csrfTok, CSRF_COOKIE_OPTS);
+      res.setHeader('X-CSRF-Token', csrfTok);
+      req.session.save(() => {
+        audit('login_step1_ok', req, { username: user.username });
+        res.json({ success: false, needsTotp: true });
+      });
+    });
+    return;
+  }
+
+  audit('login_ok', req, { username: user.username });
+
+  // Regenerar sesión para prevenir session fixation
+  req.session.regenerate((err) => {
+    if (err) {
+      console.error('[auth] session.regenerate error:', err.message);
+      return res.status(500).json({ error:'Error iniciando sesión.' });
+    }
+    req.session.userId = user.id;
+    // Emitir/rotar token CSRF tras login
+    const csrfTok = crypto.randomBytes(32).toString('base64url');
+    res.cookie('csrf', csrfTok, CSRF_COOKIE_OPTS);
+    res.setHeader('X-CSRF-Token', csrfTok);
+    req.session.save(() => {
+      const users = loadUsers();
+      const idx = users.findIndex(u => u.id === user.id);
+      if (idx !== -1) { users[idx].lastLogin = new Date().toISOString(); saveUsers(users); }
+      res.json({
+        success: true,
+        name: user.name,
+        role: user.role,
+        username: user.username,
+        mustChangePassword: !!user.mustChangePassword
+      });
+    });
+  });
+});
+
+// ── /api/auth/login-totp — segundo paso del login con código TOTP ─────────────
+// Requiere CSRF (la cookie ya se emitió en el paso 1) y está sujeto al rate limiter
+// de login para evitar fuerza bruta de códigos.
+app.post('/api/auth/login-totp', loginLimiter, async (req, res) => {
+  const { code } = req.body || {};
+  if (typeof code !== 'string' || !code.trim()) {
+    return res.status(400).json({ error:'Introduce un código.' });
+  }
+  const pendingId = req.session.pendingUserId;
+  const since     = req.session.pendingSince;
+  if (!pendingId || !since || (Date.now() - since) > 5 * 60 * 1000) {
+    return res.status(401).json({ error:'No hay un inicio de sesión pendiente. Vuelve a introducir tus credenciales.' });
+  }
+  const user = findUser(pendingId);
+  if (!user || !user.active || !user.totpEnabled || !user.totpSecret) {
+    return res.status(401).json({ error:'No se pudo completar la autenticación.' });
+  }
+
+  const trimmed = code.trim();
+  let usedBackup = false;
+  let ok = /^\d{6}$/.test(trimmed) && await totpVerify(trimmed, user.totpSecret);
+
+  if (!ok) {
+    // Si no es un código TOTP válido, probar como backup code
+    const matchIdx = await findMatchingBackupCode(trimmed, user.totpBackupCodes);
+    if (matchIdx !== -1) {
+      ok = true;
+      usedBackup = true;
+      // Consumir el código usado
+      const users = loadUsers();
+      const uidx = users.findIndex(u => u.id === user.id);
+      if (uidx !== -1) {
+        users[uidx].totpBackupCodes = (users[uidx].totpBackupCodes || []).filter((_, i) => i !== matchIdx);
+        saveUsers(users);
+      }
+    }
+  }
+
+  if (!ok) {
+    recordLoginFail(user.username);
+    audit('login_totp_fail', req, { username: user.username });
+    return res.status(401).json({ error:'Código incorrecto.' });
+  }
+
+  clearLoginFail(user.username);
+  audit('login_ok', req, { username: user.username, totp: true, backup: usedBackup });
+
+  req.session.regenerate((err) => {
+    if (err) {
+      console.error('[auth] session.regenerate error:', err.message);
+      return res.status(500).json({ error:'Error iniciando sesión.' });
+    }
+    req.session.userId = user.id;
+    const csrfTok = crypto.randomBytes(32).toString('base64url');
+    res.cookie('csrf', csrfTok, CSRF_COOKIE_OPTS);
+    res.setHeader('X-CSRF-Token', csrfTok);
+    req.session.save(() => {
+      const users = loadUsers();
+      const idx = users.findIndex(u => u.id === user.id);
+      if (idx !== -1) { users[idx].lastLogin = new Date().toISOString(); saveUsers(users); }
+      res.json({
+        success: true,
+        name: user.name,
+        role: user.role,
+        username: user.username,
+        mustChangePassword: !!user.mustChangePassword
+      });
+    });
   });
 });
 
 app.post('/api/auth/logout', (req, res) => {
-  req.session.destroy(() => res.json({ success:true }));
+  const actor = findUser(req.session.userId)?.username || req.session.userId || null;
+  req.session.destroy((err) => {
+    if (err) console.warn('[session] destroy error:', err.message);
+    else audit('logout', req, { username: actor });
+    res.clearCookie('sid');
+    res.clearCookie('csrf');
+    res.json({ success:true });
+  });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
-  const { id, username, name, role, createdAt, lastLogin } = req.user;
-  res.json({ id, username, name, role, createdAt, lastLogin });
+  const { id, username, name, role, createdAt, lastLogin, mustChangePassword, totpEnabled, totpBackupCodes } = req.user;
+  res.json({
+    id, username, name, role, createdAt, lastLogin,
+    mustChangePassword: !!mustChangePassword,
+    totpEnabled: !!totpEnabled,
+    backupCodesRemaining: Array.isArray(totpBackupCodes) ? totpBackupCodes.length : 0,
+    requireTotpForAdmins: REQUIRE_TOTP_FOR_ADMINS
+  });
 });
 
 // ── Rutas de administración de usuarios ────────────────────────────────────────
@@ -235,18 +779,31 @@ app.get('/api/admin/users', requireAuth, requireAdmin, (_req, res) => {
 });
 
 app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
-  const { username, name, password, role } = req.body;
-  if (!username || !name || !password) return res.status(400).json({ error:'Usuario, nombre y contraseña son obligatorios.' });
-  if (password.length < 8) return res.status(400).json({ error:'La contraseña debe tener al menos 8 caracteres.' });
+  const { username, name, password, role } = req.body || {};
+  if (typeof username !== 'string' || typeof name !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ error:'Usuario, nombre y contraseña son obligatorios.' });
+  }
+  if (!username || !name) return res.status(400).json({ error:'Usuario y nombre son obligatorios.' });
+  if (!/^[a-zA-Z0-9._-]{3,40}$/.test(username.trim())) {
+    return res.status(400).json({ error:'Nombre de usuario inválido (3-40 caracteres alfanuméricos, ._-).' });
+  }
+  const strengthErr = validatePasswordStrength(password);
+  if (strengthErr) return res.status(400).json({ error: strengthErr });
 
   const users = loadUsers();
   const slug = username.trim().toLowerCase();
   if (users.find(u => u.username.toLowerCase() === slug)) return res.status(409).json({ error:'Ese nombre de usuario ya existe.' });
 
   const hash = await bcrypt.hash(password, 12);
-  const user = { id:uuidv4(), username:slug, name:name.trim(), password:hash, role:role==='admin'?'admin':'user', active:true, createdAt:new Date().toISOString(), lastLogin:null };
+  const user = {
+    id:uuidv4(), username:slug, name:name.trim().substring(0,80),
+    password:hash, role: role === 'admin' ? 'admin' : 'user',
+    active:true, mustChangePassword:true,
+    createdAt:new Date().toISOString(), lastLogin:null
+  };
   users.push(user);
   saveUsers(users);
+  audit('user_create', req, { target: user.username, role: user.role });
   const { password: _p, ...safe } = user;
   res.json({ success:true, user:safe });
 });
@@ -268,15 +825,18 @@ app.patch('/api/admin/users/:id', requireAuth, requireAdmin, async (req, res) =>
     if (adminsLeft === 0) return res.status(400).json({ error:'Debe existir al menos un administrador activo.' });
   }
 
-  if (name)            users[idx].name   = name.trim();
+  if (typeof name === 'string' && name.trim()) users[idx].name = name.trim().substring(0,80);
   if (role)            users[idx].role   = role === 'admin' ? 'admin' : 'user';
   if (active !== undefined) users[idx].active = !!active;
   if (password) {
-    if (password.length < 8) return res.status(400).json({ error:'La contraseña debe tener al menos 8 caracteres.' });
+    const strengthErr = validatePasswordStrength(password);
+    if (strengthErr) return res.status(400).json({ error: strengthErr });
     users[idx].password = await bcrypt.hash(password, 12);
+    users[idx].mustChangePassword = true;
   }
 
   saveUsers(users);
+  audit('user_update', req, { target: users[idx].username, changed: Object.keys(req.body || {}).filter(k => k !== 'password').concat(req.body?.password ? ['password'] : []) });
   const { password: _p, ...safe } = users[idx];
   res.json({ success:true, user:safe });
 });
@@ -295,39 +855,252 @@ app.delete('/api/admin/users/:id', requireAuth, requireAdmin, (req, res) => {
   // Borrar también su historial y plantillas
   try { fs.unlinkSync(historyPath(id)); } catch(_){}
   try { fs.unlinkSync(templatesPath(id)); } catch(_){}
+  audit('user_delete', req, { target: target.username });
   res.json({ success:true });
 });
 
+function validatePasswordStrength(pw) {
+  if (typeof pw !== 'string' || pw.length < 12) return 'La contraseña debe tener al menos 12 caracteres.';
+  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter(r => r.test(pw)).length;
+  if (classes < 3) return 'Usa al menos 3 de: minúsculas, mayúsculas, dígitos, símbolos.';
+  return null;
+}
+
 app.post('/api/auth/change-password', requireAuth, async (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword) return res.status(400).json({ error:'Introduce la contraseña actual y la nueva.' });
-  if (newPassword.length < 8) return res.status(400).json({ error:'La nueva contraseña debe tener al menos 8 caracteres.' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword || !newPassword) {
+    return res.status(400).json({ error:'Introduce la contraseña actual y la nueva.' });
+  }
+  const strengthErr = validatePasswordStrength(newPassword);
+  if (strengthErr) return res.status(400).json({ error: strengthErr });
+  if (newPassword === currentPassword) return res.status(400).json({ error:'La nueva contraseña debe ser distinta.' });
 
   const users = loadUsers();
   const idx = users.findIndex(u => u.id === req.user.id);
+  if (idx === -1) return res.status(404).json({ error:'Usuario no encontrado.' });
   const ok = await bcrypt.compare(currentPassword, users[idx].password);
   if (!ok) return res.status(401).json({ error:'La contraseña actual no es correcta.' });
 
   users[idx].password = await bcrypt.hash(newPassword, 12);
+  users[idx].mustChangePassword = false;
   saveUsers(users);
+  audit('password_change', req, { username: users[idx].username });
+
+  // Logout global: invalidar TODAS las sesiones del usuario excepto la actual.
+  // Recorremos las entradas de sessions.sqlite y borramos las que tienen userId == este,
+  // salvo el sid actual (req.sessionID). Así, si alguien tenía sesión robada, queda fuera.
+  try {
+    const currentSid = req.sessionID;
+    const rows = sessionDb.prepare('SELECT sid, sess FROM sessions').all();
+    let invalidated = 0;
+    for (const row of rows) {
+      try {
+        const s = JSON.parse(row.sess);
+        if (s.userId === req.user.id && row.sid !== currentSid) {
+          sessionDb.prepare('DELETE FROM sessions WHERE sid = ?').run(row.sid);
+          invalidated++;
+        }
+      } catch(_) {}
+    }
+    if (invalidated) audit('sessions_revoked', req, { username: users[idx].username, count: invalidated });
+  } catch (e) {
+    console.warn('[change-password] session revoke error:', e.message);
+  }
+
   res.json({ success:true });
 });
 
-app.get('/api/health', (_req, res) => res.json({
-  status:'ok', model:MODEL, version:'9.0.0', users:loadUsers().length,
-  limits: { maqChunk:MAQ_CHUNK, maqSingle:MAQ_SINGLE, historyLimit:HISTORY_LIMIT }
-}));
+// ── 2FA TOTP ─────────────────────────────────────────────────────────────────
+// /api/auth/totp/setup: genera un secreto temporal y devuelve QR + secreto en texto.
+// El secreto SOLO queda persistido al confirmar con /api/auth/totp/enable.
+app.post('/api/auth/totp/setup', requireAuth, async (req, res) => {
+  if (req.user.totpEnabled) return res.status(400).json({ error:'2FA ya está activado en esta cuenta.' });
+  try {
+    const secret = totpGenerateSecret();
+    const issuer = 'Suite Académica';
+    const otpauth = totpUri(req.user.username, issuer, secret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth, { errorCorrectionLevel: 'M', width: 240 });
+    // Guardamos el secreto en sesión (no en disco) hasta que el usuario lo confirme con un código.
+    req.session.totpPending = { secret, issuedAt: Date.now() };
+    req.session.save(() => {
+      res.json({ success:true, secret, otpauth, qr: qrDataUrl });
+    });
+  } catch (e) {
+    console.error('[totp/setup] error:', e.message);
+    res.status(500).json({ error:'No se pudo iniciar el alta de 2FA.' });
+  }
+});
+
+// /api/auth/totp/enable: confirma con un código válido y persiste el secreto.
+app.post('/api/auth/totp/enable', requireAuth, async (req, res) => {
+  const { code } = req.body || {};
+  if (typeof code !== 'string' || !/^\d{6}$/.test(code.trim())) {
+    return res.status(400).json({ error:'Código TOTP inválido (6 dígitos).' });
+  }
+  if (req.user.totpEnabled) return res.status(400).json({ error:'2FA ya está activado.' });
+  const pending = req.session.totpPending;
+  if (!pending || !pending.secret || (Date.now() - pending.issuedAt) > 10 * 60 * 1000) {
+    return res.status(400).json({ error:'No hay un alta de 2FA en curso. Vuelve a empezar.' });
+  }
+  const ok = await totpVerify(code.trim(), pending.secret);
+  if (!ok) {
+    return res.status(401).json({ error:'Código incorrecto.' });
+  }
+  const users = loadUsers();
+  const idx = users.findIndex(u => u.id === req.user.id);
+  if (idx === -1) return res.status(404).json({ error:'Usuario no encontrado.' });
+  // Generar y persistir 10 backup codes hasheados. Los códigos en plano se devuelven UNA vez.
+  const backupCodes = generateBackupCodes(10);
+  const backupHashes = await hashBackupCodes(backupCodes);
+  users[idx].totpSecret = pending.secret;
+  users[idx].totpEnabled = true;
+  users[idx].totpEnrolledAt = new Date().toISOString();
+  users[idx].totpBackupCodes = backupHashes;
+  saveUsers(users);
+  delete req.session.totpPending;
+  audit('totp_enable', req, { username: req.user.username });
+  res.json({ success:true, backupCodes });
+});
+
+// /api/auth/totp/disable: requiere password actual (y opcionalmente un código TOTP).
+app.post('/api/auth/totp/disable', requireAuth, async (req, res) => {
+  const { password } = req.body || {};
+  if (typeof password !== 'string' || !password) {
+    return res.status(400).json({ error:'Introduce tu contraseña actual.' });
+  }
+  if (!req.user.totpEnabled) return res.status(400).json({ error:'2FA no está activado.' });
+  const users = loadUsers();
+  const idx = users.findIndex(u => u.id === req.user.id);
+  if (idx === -1) return res.status(404).json({ error:'Usuario no encontrado.' });
+  const ok = await bcrypt.compare(password, users[idx].password);
+  if (!ok) return res.status(401).json({ error:'Contraseña incorrecta.' });
+  delete users[idx].totpSecret;
+  users[idx].totpEnabled = false;
+  delete users[idx].totpEnrolledAt;
+  delete users[idx].totpBackupCodes;
+  saveUsers(users);
+  audit('totp_disable', req, { username: req.user.username });
+  res.json({ success:true });
+});
+
+// Regenerar backup codes (requiere password). Invalida los anteriores.
+app.post('/api/auth/totp/backup-codes/regenerate', requireAuth, async (req, res) => {
+  const { password } = req.body || {};
+  if (typeof password !== 'string' || !password) {
+    return res.status(400).json({ error:'Introduce tu contraseña actual.' });
+  }
+  if (!req.user.totpEnabled) return res.status(400).json({ error:'2FA no está activado.' });
+  const users = loadUsers();
+  const idx = users.findIndex(u => u.id === req.user.id);
+  if (idx === -1) return res.status(404).json({ error:'Usuario no encontrado.' });
+  const ok = await bcrypt.compare(password, users[idx].password);
+  if (!ok) return res.status(401).json({ error:'Contraseña incorrecta.' });
+  const backupCodes = generateBackupCodes(10);
+  users[idx].totpBackupCodes = await hashBackupCodes(backupCodes);
+  saveUsers(users);
+  audit('totp_backup_regen', req, { username: req.user.username });
+  res.json({ success:true, backupCodes });
+});
+
+app.get('/api/health', (req, res) => {
+  // Sin token: respuesta mínima (para health-checkers externos sin credenciales).
+  const token = req.headers['x-health-token'];
+  if (!process.env.HEALTH_TOKEN || token !== process.env.HEALTH_TOKEN) {
+    return res.json({ status:'ok' });
+  }
+  // Con token correcto: métricas completas.
+  let sessions = 0;
+  try { sessions = sessionDb.prepare('SELECT COUNT(*) AS c FROM sessions').get()?.c || 0; } catch(_) {}
+  const mem = process.memoryUsage();
+  res.json({
+    status: 'ok',
+    version: '8.1.0',
+    model: MODEL,
+    uptimeSec: Math.round(process.uptime()),
+    rssMB:   Math.round(mem.rss / 1024 / 1024),
+    heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+    sessionsActive: sessions,
+    users: loadUsers().length,
+    pid: process.pid,
+    nodeVersion: process.version
+  });
+});
 
 // ── Aplicar auth a todo lo demás ──────────────────────────────────────────────
 app.use(requireAuth);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Multer ────────────────────────────────────────────────────────────────────
+// Mimetypes permitidos en la primera línea de defensa (segunda línea = firma mágica en /api/upload)
+const ALLOWED_MIMETYPES = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/octet-stream' // algunos navegadores envían esto para .docx
+]);
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_FILE_MB*1024*1024, files: MAX_TOPICS },
-  fileFilter: (_req, file, cb) => /\.(docx?|pdf)$/i.test(file.originalname) ? cb(null,true) : cb(new Error(`Tipo no permitido: ${file.originalname}`))
+  fileFilter: (_req, file, cb) => {
+    const okExt  = /\.(docx?|pdf)$/i.test(file.originalname);
+    const okMime = ALLOWED_MIMETYPES.has((file.mimetype || '').toLowerCase());
+    if (okExt && okMime) return cb(null, true);
+    return cb(new Error('Tipo de archivo no permitido. Sólo PDF, DOC, DOCX.'));
+  }
 });
+
+// Firma mágica del fichero — comprueba los primeros bytes antes de cualquier parsing.
+// %PDF-  → PDF · PK\x03\x04 → ZIP (DOCX moderno) · D0CF11E0 → CFB (DOC antiguo y DOCX viejos)
+function detectFileSignature(buf) {
+  if (!buf || buf.length < 8) return null;
+  if (buf.slice(0, 5).toString('ascii') === '%PDF-') return 'pdf';
+  if (buf[0] === 0x50 && buf[1] === 0x4B && buf[2] === 0x03 && buf[3] === 0x04) return 'zip';
+  if (buf[0] === 0xD0 && buf[1] === 0xCF && buf[2] === 0x11 && buf[3] === 0xE0) return 'cfb';
+  return null;
+}
+
+// Envuelve una promesa con un timeout que la rechaza si tarda demasiado.
+function withTimeout(promise, ms, label = 'operación') {
+  let to;
+  const timer = new Promise((_, reject) => {
+    to = setTimeout(() => reject(new Error(`${label}: tiempo agotado`)), ms);
+  });
+  return Promise.race([promise, timer]).finally(() => clearTimeout(to));
+}
+const PARSE_TIMEOUT_MS  = parseInt(process.env.PARSE_TIMEOUT_MS || '30000');
+const PARSE_MEM_LIMIT_MB = parseInt(process.env.PARSE_MEM_LIMIT_MB || '512');
+
+// Lanza un worker para parsear el documento de forma aislada. El worker tiene
+// resourceLimits (memoria), y la promesa del padre tiene timeout + kill.
+// Si el worker excede memoria, Node lo termina y aquí cae a un reject limpio.
+function parseInWorker(type, buffer) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(path.join(__dirname, 'workers', 'parser-worker.js'), {
+      workerData: { type, buffer },
+      resourceLimits: { maxOldGenerationSizeMb: PARSE_MEM_LIMIT_MB }
+    });
+    const killTimer = setTimeout(() => {
+      reject(new Error(`worker ${type}: tiempo agotado`));
+      w.terminate().catch(() => {});
+    }, PARSE_TIMEOUT_MS);
+
+    w.once('message', (msg) => {
+      clearTimeout(killTimer);
+      w.terminate().catch(() => {});
+      if (msg && msg.ok) resolve(msg.data);
+      else reject(new Error((msg && msg.error) || 'worker: error desconocido'));
+    });
+    w.once('error', (err) => {
+      clearTimeout(killTimer);
+      reject(err);
+    });
+    w.once('exit', (code) => {
+      clearTimeout(killTimer);
+      // Si el worker terminó sin enviar mensaje (memory limit, kill...) cae aquí.
+      if (code !== 0) reject(new Error(`worker ${type}: terminado con código ${code}`));
+    });
+  });
+}
 
 // ── Helpers de Claude ─────────────────────────────────────────────────────────
 const LETTERS = ['A','B','C','D','E'];
@@ -335,15 +1108,19 @@ async function callClaude(messages, maxTokens=8000) {
   const r = await anthropic.messages.create({ model:MODEL, max_tokens:maxTokens, messages });
   return r.content.filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
 }
-function makeMessages(prompt, topic, textOverride=null) {
-  // textOverride permite pasar un chunk específico en lugar de todo el texto
+function makeMessages(prompt, topic, textOverride=null, opts = {}) {
+  // textOverride permite pasar un chunk específico en lugar de todo el texto.
+  // opts.fullText=true desactiva el truncado a MAX_CHARS (necesario para maquetación,
+  // donde necesitamos preservar el contenido íntegro del documento).
   if (textOverride) {
     return [{ role:'user', content:`CONTENIDO DE "${topic.name}":\n---\n${textOverride}\n---\n\n${prompt}` }];
   }
   if (topic?.type==='pdf' && topic.base64 && (!topic.text || topic.text.length < MAQ_SINGLE)) {
     return [{ role:'user', content:[{type:'document',source:{type:'base64',media_type:'application/pdf',data:topic.base64}},{type:'text',text:prompt}]}];
   }
-  const textToUse = topic.text ? topic.text.substring(0, MAX_CHARS) : '';
+  const textToUse = topic.text
+    ? (opts.fullText ? topic.text : topic.text.substring(0, MAX_CHARS))
+    : '';
   return [{ role:'user', content:`CONTENIDO DE "${topic.name}":\n---\n${textToUse}\n---\n\n${prompt}` }];
 }
 
@@ -877,11 +1654,50 @@ Devuelve ÚNICAMENTE JSON válido (sin texto antes ni después, sin \`\`\`json) 
 }`;
 }
 
+// Intenta recuperar JSON parcial cuando llega truncado por max_tokens.
+// Recorre los bloques abiertos en "blocks":[ y cierra en el último completo.
+function tryRecoverJson(s) {
+  const blocksIdx = s.indexOf('"blocks"');
+  if (blocksIdx < 0) return null;
+  const arrStart = s.indexOf('[', blocksIdx);
+  if (arrStart < 0) return null;
+  let depth = 0, inStr = false, esc = false, lastBlockEnd = -1;
+  for (let i = arrStart + 1; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) lastBlockEnd = i;
+    } else if (c === ']' && depth === 0) break;
+  }
+  if (lastBlockEnd < 0) return null;
+  return s.substring(0, lastBlockEnd + 1) + ']}';
+}
+
 function parseMaqJson(raw) {
   let s = raw.replace(/```json|```/g,'').trim();
   const si = s.indexOf('{'), ei = s.lastIndexOf('}') + 1;
   if (si >= 0 && ei > si) s = s.substring(si, ei);
-  const data = JSON.parse(s);
+  let data;
+  try {
+    data = JSON.parse(s);
+  } catch (e) {
+    const recovered = tryRecoverJson(s);
+    if (recovered) {
+      try {
+        data = JSON.parse(recovered);
+        data._truncated = true; // marca para reportar al frontend
+      } catch (_) {
+        throw new Error('JSON inválido y no recuperable: ' + e.message);
+      }
+    } else {
+      throw new Error('JSON inválido: ' + e.message);
+    }
+  }
   if (!data.blocks || !Array.isArray(data.blocks)) throw new Error('JSON inválido: falta blocks[]');
   return data;
 }
@@ -1086,22 +1902,35 @@ function extractAikenStems(aikenText) {
 }
 
 // ── POST /api/upload ──────────────────────────────────────────────────────────
-app.post('/api/upload', upload.array('files', MAX_TOPICS), async (req, res) => {
+app.post('/api/upload', aiLimiter, upload.array('files', MAX_TOPICS), async (req, res) => {
   if (!req.files?.length) return res.status(400).json({ error:'No se recibieron archivos.' });
   try {
     const topics = await Promise.all(req.files.map(async file => {
       const id = uuidv4();
+      // Corregir mojibake del filename si llegó UTF-8 leído como Latin-1
+      file.originalname = fixMojibake(file.originalname);
+      const isPdfExt = /\.pdf$/i.test(file.originalname);
+      const signature = detectFileSignature(file.buffer);
+
+      // Bloqueo 1: la firma debe coincidir con la extensión declarada
+      if (isPdfExt && signature !== 'pdf') {
+        throw new Error(`"${file.originalname}" no es un PDF válido (firma incorrecta).`);
+      }
+      if (!isPdfExt && signature !== 'zip' && signature !== 'cfb') {
+        throw new Error(`"${file.originalname}" no es un documento Word válido (firma incorrecta).`);
+      }
+
       let topic;
-      if (/\.pdf$/i.test(file.originalname)) {
-        // PDF: guardar base64 + extraer texto con pdf-parse
+      if (isPdfExt) {
+        // PDF: el parsing se hace en un worker aislado (memoria + timeout)
         const base64 = file.buffer.toString('base64');
         let text = '', pages = 0;
         try {
-          const parsed = await pdfParse(file.buffer);
+          const parsed = await parseInWorker('pdf', file.buffer);
           text = (parsed.text || '').trim();
           pages = parsed.numpages || 0;
         } catch(e) {
-          console.warn('pdf-parse error:', e.message);
+          console.warn('[upload] worker pdf error:', e.message);
         }
         const words = text ? text.split(/\s+/).filter(Boolean).length : 0;
         topic = {
@@ -1111,29 +1940,25 @@ app.post('/api/upload', upload.array('files', MAX_TOPICS), async (req, res) => {
           images: []
         };
       } else {
-        const images = [];
+        // DOCX: convertToHtml (con imágenes) en worker; si falla, fallback a texto plano en worker.
         const tables = [];
         let textWithMarkers = '';
+        let images = [];
         try {
-          const hr = await mammoth.convertToHtml(
-            { buffer:file.buffer },
-            { convertImage: mammoth.images.imgElement(async (image) => {
-                const buf = await image.read();
-                const idx = images.length;
-                images.push({ data:buf, type:image.contentType });
-                return { src:`__IMG_${idx}__` };
-            }) }
-          );
-          textWithMarkers = htmlToText(hr.value, tables);
-        } catch(_) {
-          const r = await mammoth.extractRawText({ buffer:file.buffer });
-          textWithMarkers = r.value.trim();
+          const r = await parseInWorker('docx-html', file.buffer);
+          // r.images viene como Array<{data:Uint8Array,type}>; convertimos a Buffer para uso interno
+          images = (r.images || []).map(im => ({ data: Buffer.from(im.data), type: im.type }));
+          textWithMarkers = htmlToText(r.html, tables);
+        } catch(e) {
+          console.warn('[upload] worker docx-html error, fallback a texto:', e.message);
+          const r = await parseInWorker('docx-text', file.buffer);
+          textWithMarkers = r.text || '';
         }
         const words = textWithMarkers.replace(/__IMG_\d+__/g,'').replace(/__TABLE_\d+__/g,'').split(/\s+/).filter(Boolean).length;
         if (words < 10) throw new Error(`"${file.originalname}" tiene muy poco texto.`);
         topic = { id, name:file.originalname, type:'docx', text:textWithMarkers, images, tables, words };
       }
-      topicCache.set(id, { ...topic, ts:Date.now() });
+      addToTopicCache(req.user.id, id, topic);
       return {
         id, name:topic.name, type:topic.type,
         words: topic.words || null,
@@ -1146,12 +1971,13 @@ app.post('/api/upload', upload.array('files', MAX_TOPICS), async (req, res) => {
     }));
     res.json({ success:true, topics });
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('[upload] error:', err.message);
+    res.status(500).json({ error:'Error procesando el documento.' });
   }
 });
 
 // ── POST /api/generate (SSE) — banco de preguntas ─────────────────────────────
-app.post('/api/generate', async (req, res) => {
+app.post('/api/generate', aiLimiter, async (req, res) => {
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
@@ -1159,8 +1985,12 @@ app.post('/api/generate', async (req, res) => {
   res.flushHeaders();
 
   const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
-  const { topicIds, config } = req.body;
-  const topics = topicIds.map(id => topicCache.get(id)).filter(Boolean);
+  const { topicIds, config } = req.body || {};
+  if (!Array.isArray(topicIds) || !topicIds.length || !config || typeof config !== 'object') {
+    send({type:'error',message:'Parámetros inválidos.'}); return res.end();
+  }
+  if (topicIds.length > MAX_TOPICS) { send({type:'error',message:'Demasiados temas.'}); return res.end(); }
+  const topics = topicIds.map(id => getOwnedTopic(req, id)).filter(Boolean);
   if (!topics.length) { send({type:'error',message:'Temas no encontrados.'}); return res.end(); }
 
   const perTopic = config.generationMode === 'pertopic';
@@ -1284,7 +2114,7 @@ app.post('/api/generate', async (req, res) => {
 });
 
 // ── POST /api/summarize (SSE) ─────────────────────────────────────────────────
-app.post('/api/summarize', async (req, res) => {
+app.post('/api/summarize', aiLimiter, async (req, res) => {
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
@@ -1292,17 +2122,20 @@ app.post('/api/summarize', async (req, res) => {
   res.flushHeaders();
 
   const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
-  const { topicIds, pages } = req.body;
-  const topics = topicIds.map(id => topicCache.get(id)).filter(Boolean);
+  const { topicIds, pages } = req.body || {};
+  if (!Array.isArray(topicIds) || !topicIds.length) { send({type:'error',message:'Temas no recibidos.'}); return res.end(); }
+  if (topicIds.length > MAX_TOPICS) { send({type:'error',message:'Demasiados temas.'}); return res.end(); }
+  const pagesNum = Math.max(1, Math.min(50, parseInt(pages) || 1));
+  const topics = topicIds.map(id => getOwnedTopic(req, id)).filter(Boolean);
   if (!topics.length) { send({type:'error',message:'Temas no encontrados.'}); return res.end(); }
-  const tw = pages * 480;
+  const tw = pagesNum * 480;
   send({ type:'start', total:topics.length });
 
   try {
     for (let i = 0; i < topics.length; i++) {
       const topic = topics[i];
       send({ type:'progress', current:i+1, total:topics.length, name:topic.name });
-      const prompt = `Genera un resumen académico exhaustivo con aproximadamente ${tw} palabras (${pages} páginas Word). Organízalo con SUBTÍTULOS EN MAYÚSCULAS para cada bloque temático. Cubre TODOS los conceptos. Español académico correcto. Todos los párrafos deben terminar con punto. Alcanza los ${tw} palabras.`;
+      const prompt = `Genera un resumen académico exhaustivo con aproximadamente ${tw} palabras (${pagesNum} páginas Word). Organízalo con SUBTÍTULOS EN MAYÚSCULAS para cada bloque temático. Cubre TODOS los conceptos. Español académico correcto. Todos los párrafos deben terminar con punto. Alcanza los ${tw} palabras.`;
       const text = await callClaude(
         makeMessages(prompt, topic),
         Math.min(16000, Math.max(4000, tw*2))
@@ -1311,15 +2144,17 @@ app.post('/api/summarize', async (req, res) => {
     }
     send({ type:'complete' });
   } catch(err) {
-    send({ type:'error', message: err.message });
+    console.error('[summarize] error:', err.message);
+    send({ type:'error', message: 'Error generando el resumen.' });
   } finally {
     res.end();
   }
 });
 
 app.post('/api/summary-docx', async (req,res) => {
-  const { name, text } = req.body;
-  if (!text) return res.status(400).json({ error:'Sin contenido.' });
+  const { name, text } = req.body || {};
+  if (typeof text !== 'string' || !text) return res.status(400).json({ error:'Sin contenido.' });
+  if (text.length > 200000) return res.status(413).json({ error:'Texto demasiado largo.' });
   try {
     const buf = await Packer.toBuffer(buildSummaryDoc(name || 'Resumen', text));
     const safe = (name || 'resumen')
@@ -1330,14 +2165,15 @@ app.post('/api/summary-docx', async (req,res) => {
     res.setHeader('Content-Disposition',`attachment; filename="resumen_${safe}.docx"`);
     res.send(buf);
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('[summary-docx] error:', err.message);
+    res.status(500).json({ error:'Error generando el documento.' });
   }
 });
 
 // ── POST /api/map — mapa conceptual (radial + Novak) ──────────────────────────
-app.post('/api/map', async (req, res) => {
-  const { topicId, depth, style } = req.body;
-  const topic = topicCache.get(topicId);
+app.post('/api/map', aiLimiter, async (req, res) => {
+  const { topicId, depth, style } = req.body || {};
+  const topic = getOwnedTopic(req, topicId);
   if (!topic) return res.status(404).json({ error:'Tema no encontrado.' });
   const mapStyle = style === 'novak' ? 'novak' : 'radial';
 
@@ -1360,7 +2196,8 @@ Estructura: ${dm[depth] || dm.completo}`;
       if (!data.title || !data.branches?.length) throw new Error('JSON inválido');
       return res.json({ success:true, style:'radial', data });
     } catch(err) {
-      return res.status(500).json({ error: err.message });
+      console.error('[map radial] error:', err.message);
+      return res.status(500).json({ error:'No se pudo generar el mapa.' });
     }
   }
 
@@ -1410,12 +2247,13 @@ ESTRUCTURA OBJETIVO: ${dm[depth] || dm.completo}`;
     if (!data.propositions.length) throw new Error('Sin proposiciones válidas');
     return res.json({ success:true, style:'novak', data });
   } catch(err) {
-    return res.status(500).json({ error: err.message });
+    console.error('[map novak] error:', err.message);
+    return res.status(500).json({ error:'No se pudo generar el mapa.' });
   }
 });
 
 // ── POST /api/maqueta (SSE) — maquetación con chunking PARALELO + normalización
-app.post('/api/maqueta', async (req, res) => {
+app.post('/api/maqueta', aiLimiter, async (req, res) => {
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
@@ -1423,8 +2261,8 @@ app.post('/api/maqueta', async (req, res) => {
   res.flushHeaders();
 
   const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
-  const { topicId } = req.body;
-  const topic = topicCache.get(topicId);
+  const { topicId } = req.body || {};
+  const topic = getOwnedTopic(req, topicId);
   if (!topic) { send({type:'error',message:'Tema no encontrado.'}); return res.end(); }
 
   const hasImages = topic.images?.length > 0;
@@ -1434,11 +2272,12 @@ app.post('/api/maqueta', async (req, res) => {
 
   try {
     if (!useChunking) {
-      // Documento pequeño o PDF nativo: llamada única
+      // Documento pequeño o PDF nativo: llamada única. Pasamos el texto íntegro
+      // (sin truncar a MAX_CHARS, que es para preguntas/quiz pero NO para maquetación).
       send({ type:'start', mode:'single', totalChunks:1 });
       send({ type:'progress', chunk:1, total:1, pct:20, label:'Analizando estructura del documento...' });
       const prompt = buildMaquetaPrompt({ hasImages, hasTables, chunkMode:false });
-      const raw = await callClaude(makeMessages(prompt, topic), 16000);
+      const raw = await callClaude(makeMessages(prompt, topic, null, { fullText: true }), MAQ_MAX_TOKENS);
       send({ type:'progress', chunk:1, total:1, pct:85, label:'Procesando respuesta...' });
       let data = parseMaqJson(raw);
       data = normalizeMaquetaData(data, {
@@ -1464,7 +2303,10 @@ app.post('/api/maqueta', async (req, res) => {
     }
 
     const chunks = splitIntoChunks(topic.text, MAQ_CHUNK);
-    send({ type:'start', mode:'chunked', totalChunks:chunks.length, textLength, pages:topic.pages||null });
+    // Si el split devuelve sólo 1 chunk (texto entre MAQ_SINGLE y MAQ_CHUNK), tratamos como single
+    // — el prompt en chunkMode confunde al modelo cuando hay una sola "sección".
+    const useChunkMode = chunks.length > 1;
+    send({ type:'start', mode: useChunkMode ? 'chunked' : 'single-from-chunked', totalChunks:chunks.length, textLength, pages:topic.pages||null });
 
     // Procesar chunks con concurrencia limitada para acelerar el maquetado
     const CONCURRENCY = parseInt(process.env.MAQ_CONCURRENCY || '3');
@@ -1479,21 +2321,42 @@ app.post('/api/maqueta', async (req, res) => {
           chunk: i+1,
           total: chunks.length,
           pct: Math.round((completed / chunks.length) * 92) + 4,
-          label: `Maquetando sección ${i+1} de ${chunks.length}...`
+          label: useChunkMode ? `Maquetando sección ${i+1} de ${chunks.length}...` : 'Maquetando documento...'
         });
         const chunkPrompt = buildMaquetaPrompt({
           hasImages, hasTables,
-          chunkMode: true,
-          chunkInfo: `sección ${i+1} de ${chunks.length}`
+          chunkMode: useChunkMode,
+          chunkInfo: useChunkMode ? `sección ${i+1} de ${chunks.length}` : null
         });
-        const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}" (sección ${i+1}/${chunks.length}):\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
-        try {
-          const raw = await callClaude(msg, 16000);
-          const data = parseMaqJson(raw);
+        const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}"${useChunkMode ? ` (sección ${i+1}/${chunks.length})` : ''}:\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
+        // Hasta 2 reintentos si el parsing falla (max_tokens, JSON malformado puntual)
+        let lastErr = null, data = null;
+        for (let attempt = 0; attempt < 2 && !data; attempt++) {
+          try {
+            const raw = await callClaude(msg, MAQ_MAX_TOKENS);
+            data = parseMaqJson(raw);
+          } catch (e) {
+            lastErr = e;
+            console.warn(`[maqueta] chunk ${i+1} intento ${attempt+1} falló: ${e.message}`);
+          }
+        }
+        if (data) {
           results[i] = data;
-        } catch (e) {
-          send({ type:'chunk_error', chunk:i+1, message:e.message });
-          results[i] = { title:'', blocks: [] };
+          if (data._truncated) {
+            send({ type:'chunk_warning', chunk:i+1, message:'Sección recuperada parcialmente (output truncado).' });
+          }
+        } else {
+          // Última línea de defensa: bloque fallback con el texto crudo del chunk para no perderlo.
+          send({ type:'chunk_error', chunk:i+1, message:`No se pudo maquetar esta sección: ${lastErr?.message || 'error desconocido'}. Se conservará el texto crudo.` });
+          results[i] = {
+            title: '',
+            blocks: [
+              { t: 'h2', n: '', text: `Sección ${i+1} (sin maquetar).` },
+              { t: 'p', text: `⚠ Esta sección no se pudo maquetar automáticamente; se conserva el texto original a continuación.` },
+              { t: 'p', text: chunks[i].substring(0, 8000) }
+            ],
+            _failed: true
+          };
         }
         completed++;
         send({
@@ -1508,6 +2371,10 @@ app.post('/api/maqueta', async (req, res) => {
     const workers = [];
     for (let w = 0; w < Math.min(CONCURRENCY, chunks.length); w++) workers.push(worker());
     await Promise.all(workers);
+
+    // Reportar al frontend cuántas secciones quedaron incompletas
+    const failedCount = results.filter(r => r && r._failed).length;
+    const truncatedCount = results.filter(r => r && r._truncated).length;
 
     // Unificar resultados conservando el ORDEN de los chunks
     const allBlocks = [];
@@ -1532,20 +2399,23 @@ app.post('/api/maqueta', async (req, res) => {
       type:'complete',
       data: finalData,
       stats,
-      truncated: false,
+      truncated: failedCount > 0 || truncatedCount > 0,
+      failedChunks: failedCount,
+      truncatedChunks: truncatedCount,
       hasImages, hasTables,
       mode:'chunked',
       processedChunks: chunks.length
     });
     res.end();
   } catch(err) {
-    send({ type:'error', message: err.message });
+    console.error('[maqueta] error:', err.message);
+    send({ type:'error', message: 'Error procesando la maquetación.' });
     res.end();
   }
 });
 
 // ── POST /api/maqueta-batch (SSE) — varios temas en serie ─────────────────────
-app.post('/api/maqueta-batch', async (req, res) => {
+app.post('/api/maqueta-batch', aiLimiter, async (req, res) => {
   res.setHeader('Content-Type','text/event-stream');
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
@@ -1553,12 +2423,13 @@ app.post('/api/maqueta-batch', async (req, res) => {
   res.flushHeaders();
 
   const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
-  const { topicIds } = req.body;
+  const { topicIds } = req.body || {};
   if (!Array.isArray(topicIds) || !topicIds.length) {
     send({type:'error', message:'Sin documentos seleccionados.'});
     return res.end();
   }
-  const topics = topicIds.map(id => topicCache.get(id)).filter(Boolean);
+  if (topicIds.length > MAX_TOPICS) { send({type:'error', message:'Demasiados temas.'}); return res.end(); }
+  const topics = topicIds.map(id => getOwnedTopic(req, id)).filter(Boolean);
   if (!topics.length) { send({type:'error', message:'Temas no encontrados.'}); return res.end(); }
 
   send({ type:'batch_start', total: topics.length });
@@ -1578,7 +2449,7 @@ app.post('/api/maqueta-batch', async (req, res) => {
       if (!useChunking) {
         send({ type:'topic_progress', ti, pct:30, label:'Analizando estructura...' });
         const prompt = buildMaquetaPrompt({ hasImages, hasTables, chunkMode:false });
-        const raw = await callClaude(makeMessages(prompt, topic), 16000);
+        const raw = await callClaude(makeMessages(prompt, topic, null, { fullText: true }), MAQ_MAX_TOKENS);
         const data = parseMaqJson(raw);
         send({ type:'topic_progress', ti, pct:80, label:'Normalizando resultado...' });
         finalData = normalizeMaquetaData(data, {
@@ -1587,7 +2458,8 @@ app.post('/api/maqueta-batch', async (req, res) => {
         });
       } else {
         const chunks = splitIntoChunks(topic.text, MAQ_CHUNK);
-        send({ type:'topic_progress', ti, pct:5, label:`Documento grande · ${chunks.length} secciones.` });
+        const useChunkMode = chunks.length > 1;
+        send({ type:'topic_progress', ti, pct:5, label: useChunkMode ? `Documento grande · ${chunks.length} secciones.` : 'Maquetando documento...' });
         const CONCURRENCY = parseInt(process.env.MAQ_CONCURRENCY || '3');
         const arr = new Array(chunks.length);
         let completed = 0, nextIdx = 0;
@@ -1595,16 +2467,27 @@ app.post('/api/maqueta-batch', async (req, res) => {
           while (nextIdx < chunks.length) {
             const i = nextIdx++;
             const chunkPrompt = buildMaquetaPrompt({
-              hasImages, hasTables, chunkMode:true,
-              chunkInfo:`sección ${i+1} de ${chunks.length}`
+              hasImages, hasTables, chunkMode: useChunkMode,
+              chunkInfo: useChunkMode ? `sección ${i+1} de ${chunks.length}` : null
             });
-            const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}" (sección ${i+1}/${chunks.length}):\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
-            try {
-              const raw = await callClaude(msg, 16000);
-              arr[i] = parseMaqJson(raw);
-            } catch(e) {
-              arr[i] = { title:'', blocks:[] };
+            const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}"${useChunkMode ? ` (sección ${i+1}/${chunks.length})` : ''}:\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
+            let lastErr = null, data = null;
+            for (let attempt = 0; attempt < 2 && !data; attempt++) {
+              try {
+                const raw = await callClaude(msg, MAQ_MAX_TOKENS);
+                data = parseMaqJson(raw);
+              } catch(e) { lastErr = e; }
             }
+            if (data) arr[i] = data;
+            else arr[i] = {
+              title: '',
+              blocks: [
+                { t: 'h2', n: '', text: `Sección ${i+1} (sin maquetar).` },
+                { t: 'p', text: `⚠ No se pudo maquetar automáticamente esta sección (${lastErr?.message || 'error'}). Texto original a continuación.` },
+                { t: 'p', text: chunks[i].substring(0, 8000) }
+              ],
+              _failed: true
+            };
             completed++;
             send({ type:'topic_progress', ti,
               pct: 5 + Math.round((completed / chunks.length) * 85),
@@ -1616,6 +2499,8 @@ app.post('/api/maqueta-batch', async (req, res) => {
         await Promise.all(workers);
         const allBlocks = [];
         let finalTitle = '';
+        const failed = arr.filter(r => r && r._failed).length;
+        const truncated = arr.filter(r => r && r._truncated).length;
         for (let i = 0; i < arr.length; i++) {
           const r = arr[i] || { blocks: [] };
           if (i === 0 && r.title) finalTitle = r.title;
@@ -1628,11 +2513,13 @@ app.post('/api/maqueta-batch', async (req, res) => {
           imgCount: topic.images?.length || 0,
           tblCount: topic.tables?.length || 0
         });
+        finalData._failedChunks = failed;
+        finalData._truncatedChunks = truncated;
       }
 
       const stats = finalData.blocks.reduce((s,b) => { s[b.t] = (s[b.t]||0) + 1; return s; }, {});
       results.push({ topicId: topic.id, name: topic.name, data: finalData, stats });
-      send({ type:'topic_complete', ti, name:topic.name, data:finalData, stats, hasImages, hasTables });
+      send({ type:'topic_complete', ti, name:topic.name, data:finalData, stats, hasImages, hasTables, failedChunks: finalData._failedChunks || 0, truncatedChunks: finalData._truncatedChunks || 0 });
     } catch(err) {
       send({ type:'topic_error', ti, name:topic.name, message:err.message });
     }
@@ -1644,8 +2531,9 @@ app.post('/api/maqueta-batch', async (req, res) => {
 
 // ── POST /api/maqueta-zip — empaqueta varios .docx maquetados en un ZIP ──────
 app.post('/api/maqueta-zip', async (req, res) => {
-  const { items, templateId, colors } = req.body;
+  const { items, templateId, colors } = req.body || {};
   if (!Array.isArray(items) || !items.length) return res.status(400).json({ error:'Sin documentos.' });
+  if (items.length > MAX_TOPICS) return res.status(400).json({ error:'Demasiados documentos.' });
 
   // Resolver colores comunes para todo el lote
   let finalColors = null;
@@ -1662,7 +2550,7 @@ app.post('/api/maqueta-zip', async (req, res) => {
     for (const it of items) {
       const { data, topicId, quiz } = it;
       if (!data || !Array.isArray(data.blocks)) continue;
-      const topic = topicId ? topicCache.get(topicId) : null;
+      const topic = topicId ? getOwnedTopic(req, topicId) : null;
       const imageStore = topic?.images || null;
       const tableStore = topic?.tables || null;
 
@@ -1691,14 +2579,15 @@ app.post('/api/maqueta-zip', async (req, res) => {
     res.setHeader('Content-Disposition','attachment; filename="maquetados.zip"');
     res.send(buf);
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('[maqueta-zip] error:', err.message);
+    res.status(500).json({ error:'Error generando el ZIP.' });
   }
 });
 
 // ── POST /api/maqueta-quiz — genera autoevaluación integrada en JSON ─────────
-app.post('/api/maqueta-quiz', async (req, res) => {
-  const { topicId, type, num, diff } = req.body;
-  const topic = topicCache.get(topicId);
+app.post('/api/maqueta-quiz', aiLimiter, async (req, res) => {
+  const { topicId, type, num, diff } = req.body || {};
+  const topic = getOwnedTopic(req, topicId);
   if (!topic) return res.status(404).json({ error:'Tema no encontrado.' });
   const cleanType = ['vf','3opt','4opt'].includes(type) ? type : '4opt';
   const cleanDiff = ['bajo','medio','alto'].includes(diff) ? diff : 'medio';
@@ -1764,16 +2653,17 @@ Devuelve ÚNICAMENTE JSON válido (sin texto antes ni después, sin \`\`\`json):
     }).filter(q => q.q.length > 5 && (cleanType === 'vf' || (q.options && q.options.length === numOpts)));
     res.json({ success:true, type:cleanType, diff:cleanDiff, questions });
   } catch(err) {
-    res.status(500).json({ error:'No se pudo generar la autoevaluación: ' + err.message });
+    console.error('[maqueta-quiz] error:', err.message);
+    res.status(500).json({ error:'No se pudo generar la autoevaluación.' });
   }
 });
 
 // ── POST /api/maqueta-docx — genera Word con plantilla de color ──────────────
 app.post('/api/maqueta-docx', async (req, res) => {
-  const { data, topicId, templateId, colors, quiz } = req.body;
+  const { data, topicId, templateId, colors, quiz } = req.body || {};
   if (!data || !Array.isArray(data.blocks)) return res.status(400).json({ error:'Sin datos.' });
   try {
-    const topic = topicId ? topicCache.get(topicId) : null;
+    const topic = topicId ? getOwnedTopic(req, topicId) : null;
     const imageStore = topic?.images || null;
     const tableStore = topic?.tables || null;
 
@@ -1810,22 +2700,73 @@ app.post('/api/maqueta-docx', async (req, res) => {
     res.setHeader('Content-Disposition',`attachment; filename="${safe}_maquetado.docx"`);
     res.send(buf);
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('[maqueta-docx] error:', err.message);
+    res.status(500).json({ error:'Error generando el documento.' });
   }
 });
 
+// Corrige mojibake de UTF-8 mal interpretado como Latin-1 (típico en filenames de multer
+// cuando el navegador envía el Content-Disposition sin charset). Ej: "tecnologías" llega
+// como "tecnologÃ­as" (bytes UTF-8 leídos byte-a-byte como Latin-1).
+function fixMojibake(s) {
+  if (typeof s !== 'string' || !s) return s;
+  // Si tiene marcadores típicos de mojibake (Ã seguido de ASCII low-ish) y al re-decodificar
+  // como UTF-8 sale algo "más limpio", devolvemos la versión re-decodificada.
+  if (!/[ÃÂ]/.test(s)) return s;
+  try {
+    const decoded = Buffer.from(s, 'latin1').toString('utf8');
+    // Heurística: si el re-decodificado contiene MENOS chars de mojibake que el original
+    // y al menos uno de los caracteres acentuados habituales, lo aceptamos.
+    const before = (s.match(/[ÃÂ]/g) || []).length;
+    const after  = (decoded.match(/[ÃÂ]/g) || []).length;
+    if (after < before && /[áéíóúñÁÉÍÓÚÑ¿¡]/.test(decoded)) return decoded;
+  } catch(_) {}
+  return s;
+}
+
+// Sanitiza un nombre de fichero para evitar path traversal y caracteres peligrosos
+function sanitizeFilename(raw, fallback = 'archivo') {
+  let name = String(raw || '').trim();
+  // Quitar separadores de ruta y caracteres no imprimibles
+  name = name.replace(/[\\\/\x00-\x1f]/g, '_');
+  // Quitar prefijos ".." sucesivos
+  name = name.replace(/^(\.+[\\\/])+/, '').replace(/\.\.+/g, '.');
+  // Whitelist conservadora: letras, números, _ - . espacio y vocales acentuadas comunes
+  name = name.replace(/[^\w\-. áéíóúüñÁÉÍÓÚÜÑ]/g, '_');
+  name = name.substring(0, 80).trim();
+  return name || fallback;
+}
+
 app.post('/api/zip', async (req, res) => {
-  const { files } = req.body;
-  if (!files?.length) return res.status(400).json({ error:'Sin archivos' });
+  const { files } = req.body || {};
+  if (!Array.isArray(files) || !files.length) return res.status(400).json({ error:'Sin archivos' });
+  if (files.length > 200) return res.status(400).json({ error:'Demasiados archivos.' });
+
+  const MAX_TOTAL_BYTES = 100 * 1024 * 1024; // 100 MB total
+  let total = 0;
   try {
     const zip = new JSZip();
-    files.forEach(f => zip.file(f.name, f.content));
+    for (const f of files) {
+      if (!f || typeof f.name !== 'string' || !('content' in f)) continue;
+      const safeName = sanitizeFilename(f.name, 'archivo');
+      let content = f.content;
+      // Aceptamos string, Array de bytes o Uint8Array serializado a array
+      if (Array.isArray(content)) content = Buffer.from(content);
+      else if (typeof content === 'string') content = Buffer.from(content, 'utf8');
+      else continue;
+      total += content.length;
+      if (total > MAX_TOTAL_BYTES) {
+        return res.status(413).json({ error: 'El paquete excede el tamaño máximo permitido.' });
+      }
+      zip.file(safeName, content);
+    }
     const buf = await zip.generateAsync({ type:'nodebuffer', compression:'DEFLATE' });
     res.setHeader('Content-Type','application/zip');
     res.setHeader('Content-Disposition','attachment; filename="exportacion.zip"');
     res.send(buf);
   } catch(err) {
-    res.status(500).json({ error: err.message });
+    console.error('[zip] error:', err.message);
+    res.status(500).json({ error:'Error generando el ZIP.' });
   }
 });
 
@@ -1949,25 +2890,80 @@ app.delete('/api/templates/:id', (req, res) => {
 });
 
 // ── Moodle API (Moodle 4.1+ / Moodle 5) ──────────────────────────────────────
+// Comprueba si una IP es privada / loopback / link-local / unique-local IPv6.
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  if (net.isIPv4(ip)) {
+    const parts = ip.split('.').map(Number);
+    const [a,b] = parts;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a >= 224) return true;            // multicast / reserved
+    return false;
+  }
+  if (net.isIPv6(ip)) {
+    const norm = ip.toLowerCase();
+    if (norm === '::1' || norm === '::') return true;
+    if (norm.startsWith('fe80:')) return true;     // link-local
+    if (/^f[cd][0-9a-f]{2}:/.test(norm)) return true; // ULA fc00::/7
+    if (norm.startsWith('ff')) return true;        // multicast
+    if (norm.startsWith('::ffff:')) {              // IPv4-mapped
+      return isPrivateIp(norm.split('::ffff:')[1]);
+    }
+    return false;
+  }
+  return true;
+}
+
+// Resuelve un URL externo y rechaza destinos privados/loopback (anti-SSRF).
+async function assertSafeExternalUrl(rawUrl) {
+  let u;
+  try { u = new URL(rawUrl); } catch(_) { throw new Error('URL inválida.'); }
+  if (u.protocol !== 'https:') throw new Error('La URL debe usar HTTPS.');
+  if (!u.hostname) throw new Error('URL sin host.');
+  // Si ya es IP literal, valida directamente
+  if (net.isIP(u.hostname)) {
+    if (isPrivateIp(u.hostname)) throw new Error('Dirección de red no permitida.');
+    return u;
+  }
+  // Resolver DNS y rechazar si alguna IP es privada (mitiga DNS rebinding parcial)
+  let addrs;
+  try { addrs = await dns.lookup(u.hostname, { all: true }); }
+  catch(_) { throw new Error('No se pudo resolver el dominio.'); }
+  for (const a of addrs) {
+    if (isPrivateIp(a.address)) throw new Error('El dominio resuelve a una red interna no permitida.');
+  }
+  return u;
+}
+
 async function callMoodle(baseUrl, token, wsfunction, params={}) {
-  const endpoint = `${baseUrl.replace(/\/+$/,'')}/webservice/rest/server.php`;
+  // Validar URL antes de cualquier fetch
+  const u = await assertSafeExternalUrl(baseUrl);
+  const endpoint = `${u.origin}${u.pathname.replace(/\/+$/,'')}/webservice/rest/server.php`;
   const body = new URLSearchParams({ wstoken:token, wsfunction, moodlewsrestformat:'json', ...params });
   const response = await fetch(endpoint, {
     method: 'POST',
     body: body.toString(),
     headers: { 'Content-Type':'application/x-www-form-urlencoded' },
-    signal: AbortSignal.timeout(30000)
+    signal: AbortSignal.timeout(30000),
+    redirect: 'error'      // sin seguir redirecciones (evita bypass del filtro)
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   const data = await response.json();
-  if (data?.exception) throw new Error(data.message || data.debuginfo || data.exception);
-  if (data?.error) throw new Error(data.error);
+  if (data?.exception) throw new Error(data.message || 'Error de Moodle');
+  if (data?.error) throw new Error('Error de Moodle');
   return data;
 }
 
 app.post('/api/moodle/test', async (req, res) => {
-  const { url, token } = req.body;
-  if (!url || !token) return res.status(400).json({ error:'URL y token obligatorios.' });
+  const { url, token } = req.body || {};
+  if (typeof url !== 'string' || typeof token !== 'string' || !url || !token) {
+    return res.status(400).json({ error:'URL y token obligatorios.' });
+  }
   try {
     const info = await callMoodle(url, token, 'core_webservice_get_site_info');
     res.json({
@@ -1976,13 +2972,16 @@ app.post('/api/moodle/test', async (req, res) => {
       userid:info.userid, username:info.username, fullname:info.fullname
     });
   } catch(err) {
-    res.status(400).json({ error:'No se pudo conectar: ' + err.message });
+    console.warn('[moodle/test] error:', err.message);
+    res.status(400).json({ error:'No se pudo conectar con el servidor Moodle.' });
   }
 });
 
 app.post('/api/moodle/courses', async (req, res) => {
-  const { url, token, userid } = req.body;
-  if (!url || !token) return res.status(400).json({ error:'URL y token obligatorios.' });
+  const { url, token, userid } = req.body || {};
+  if (typeof url !== 'string' || typeof token !== 'string' || !url || !token) {
+    return res.status(400).json({ error:'URL y token obligatorios.' });
+  }
   try {
     let courses;
     if (userid) {
@@ -1995,15 +2994,21 @@ app.post('/api/moodle/courses', async (req, res) => {
       .map(c => ({ id:c.id, shortname:c.shortname, fullname:c.fullname }));
     res.json({ success:true, courses:list });
   } catch(err) {
-    res.status(400).json({ error:'Error obteniendo cursos: ' + err.message });
+    console.warn('[moodle/courses] error:', err.message);
+    res.status(400).json({ error:'Error obteniendo cursos.' });
   }
 });
 
 app.post('/api/moodle/import', async (req, res) => {
-  const { url, token, courseid, giftContent, filename } = req.body;
-  if (!url || !token || !courseid || !giftContent) return res.status(400).json({ error:'Faltan parámetros.' });
+  const { url, token, courseid, giftContent, filename } = req.body || {};
+  if (typeof url !== 'string' || typeof token !== 'string' || !url || !token || !courseid || typeof giftContent !== 'string' || !giftContent) {
+    return res.status(400).json({ error:'Faltan parámetros.' });
+  }
+  if (giftContent.length > 5 * 1024 * 1024) {
+    return res.status(413).json({ error:'Contenido demasiado grande.' });
+  }
   try {
-    const fname = (filename || 'banco_preguntas').replace(/[^a-zA-Z0-9_\-]/g,'_') + '.gift';
+    const fname = (filename || 'banco_preguntas').replace(/[^a-zA-Z0-9_\-]/g,'_').substring(0,60) + '.gift';
     const uploadResult = await callMoodle(url, token, 'core_files_upload', {
       component:'user', filearea:'draft', itemid:'0', filepath:'/',
       filename:fname,
@@ -2018,23 +3023,29 @@ app.post('/api/moodle/import', async (req, res) => {
       });
       return res.json({ success:true, method:'direct', message:`✓ Banco de preguntas importado correctamente en el curso (ID ${courseid}).` });
     } catch(importErr) {
+      console.warn('[moodle/import] manual fallback:', importErr.message);
       return res.json({
         success:true, method:'manual',
-        message:`Archivo subido a Moodle. Impórtalo manualmente: Banco de preguntas → Importar → Formato GIFT → seleccionar "${fname}" desde borradores.`,
-        importError: importErr.message
+        message:`Archivo subido a Moodle. Impórtalo manualmente: Banco de preguntas → Importar → Formato GIFT → seleccionar "${fname}" desde borradores.`
       });
     }
   } catch(err) {
-    res.status(400).json({ error:'Error: ' + err.message });
+    console.warn('[moodle/import] error:', err.message);
+    res.status(400).json({ error:'Error al importar a Moodle.' });
   }
 });
 
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+// Para rutas con extensión típica de recurso (no SPA), devolver 404. Evita que crawlers
+// indexen `index.html` con URLs falsas y reduce confusión para escáneres.
+app.get('*', (req, res) => {
+  if (/\.[a-zA-Z0-9]{1,8}$/.test(req.path)) return res.status(404).send('Not found');
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 // ── Arranque ──────────────────────────────────────────────────────────────────
 initUsers().then(() => {
   app.listen(PORT, HOST, () => {
-    console.log(`\n✅  Suite Académica Moodle · v9.0`);
+    console.log(`\n✅  Suite Académica Moodle · v8.1`);
     console.log(`   URL    : http://${HOST==='0.0.0.0'?'localhost':HOST}:${PORT}`);
     console.log(`   Modelo : ${MODEL}`);
     console.log(`   Usuarios: ${loadUsers().length} registrados`);

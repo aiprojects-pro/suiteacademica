@@ -1,0 +1,14 @@
+# Namespace dedicado para la aplicación.
+# En OKD/OpenShift es preferible crear un "Project" con `oc new-project`,
+# pero un Namespace funciona igual y es portable a cualquier Kubernetes.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: suiteacademica
+  labels:
+    app: suiteacademica
+    # Para SCC: requerido en algunos clusters para que el SCC asigne UIDs.
+    # No tocar a no ser que el admin lo necesite.
+    openshift.io/cluster-monitoring: "false"
+  annotations:
+    openshift.io/description: "Suite Académica Moodle - generación con IA"

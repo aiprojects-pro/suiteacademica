@@ -1,0 +1,92 @@
+# ─────────────────────────────────────────────────────────────────────
+#  Deployment de la aplicación.
+#
+#  Una sola réplica (SNO + RWO de LVM no permite réplicas que escriban).
+#  El strategy es Recreate para evitar dos pods escribiendo a la vez al PVC.
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: suiteacademica
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+  annotations:
+    # Trigger: redespliega cuando hay nueva imagen :latest del ImageStream.
+    image.openshift.io/triggers: |
+      [{"from":{"kind":"ImageStreamTag","name":"suiteacademica:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"app\")].image"}]
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate         # no puede haber dos pods simultáneos con RWO
+  selector:
+    matchLabels:
+      app: suiteacademica
+  template:
+    metadata:
+      labels:
+        app: suiteacademica
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      # securityContext es respetado por SCC restricted-v2:
+      #   runAsNonRoot true es obligatorio; el UID lo asigna el SCC.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        # fsGroup hace que el PVC se monte con group ownership coherente.
+        # En SCC restricted-v2 también es asignado por el SCC, no hace falta tocarlo.
+      containers:
+        - name: app
+          image: suiteacademica:latest   # el trigger lo resolverá al ImageStreamTag completo
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: suiteacademica-config
+            - secretRef:
+                name: suiteacademica-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          # Healthchecks usando /api/health (devuelve {status:'ok'} sin auth)
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12       # hasta 60s para arrancar (carga sqlite, etc.)
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1.5Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # Node JIT + tmp interno; el PVC se monta aparte
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: suiteacademica-data

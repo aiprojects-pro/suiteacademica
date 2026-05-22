@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────────────
+#  PersistentVolumeClaim para los datos de la aplicación:
+#    - data/users.json           (cuentas + secretos TOTP)
+#    - data/sessions/sessions.sqlite
+#    - data/history/<uid>.json   (historial por usuario)
+#    - data/templates/<uid>.json (plantillas de color)
+#    - data/audit.log*           (auditoría rotada)
+#
+#  StorageClass: LVMS (LVM Storage Operator).
+#  En SNO típicamente se llama `lvms-vg1`. Comprobar con:
+#    oc get sc
+#  Si tu cluster usa otro nombre (p.ej. `lvms-thinpool`, `lvm-csi`...) ajústalo.
+#  LVMS provee RWO (ReadWriteOnce), suficiente para 1 réplica en SNO.
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: suiteacademica-data
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+    role: data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: lvms-vg1   # ← ajustar si el SC del cluster se llama distinto
+  resources:
+    requests:
+      storage: 5Gi

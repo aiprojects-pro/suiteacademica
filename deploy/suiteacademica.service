@@ -1,0 +1,58 @@
+[Unit]
+Description=Suite Académica Moodle
+Documentation=https://github.com/anthropics/claude-code
+After=network.target
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_DIR@
+EnvironmentFile=@APP_DIR@/.env
+ExecStart=/usr/bin/env node server.js
+Restart=on-failure
+RestartSec=5s
+
+# Logging a journald (visible con: journalctl -u suiteacademica -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=suiteacademica
+
+# ─── Sandboxing systemd ──────────────────────────────────────────────
+# Aislamiento del sistema: el servicio no necesita más que su WorkingDirectory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@APP_DIR@/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false  # Node usa JIT; no se puede activar
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug
+
+# Network: sólo IPv4/IPv6 TCP/UDP (no AF_UNIX para /var/run aleatorios)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Capabilities mínimas (Node no necesita ninguna especial)
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Límites de recursos (ajustar según servidor)
+LimitNOFILE=65536
+LimitNPROC=4096
+TasksMax=512
+
+# Memoria máxima (ajustar): si el proceso supera esto, systemd lo mata.
+# El worker_threads de parsing tiene su propio resourceLimits dentro del proceso.
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

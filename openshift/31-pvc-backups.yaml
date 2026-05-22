@@ -1,0 +1,19 @@
+# ─────────────────────────────────────────────────────────────────────
+#  PersistentVolumeClaim para los backups producidos por el CronJob.
+#  Separado del PVC de datos para poder hacer snapshots/copias externas
+#  sin tocar el volumen activo.
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: suiteacademica-backups
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+    role: backups
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: lvms-vg1   # ← mismo SC que el de datos
+  resources:
+    requests:
+      storage: 10Gi

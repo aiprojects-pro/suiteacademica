@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────
+#  ImageStream + BuildConfig para construir la imagen DENTRO del cluster
+#  a partir del Containerfile.
+#
+#  El admin sube el código con:
+#    oc start-build suiteacademica --from-dir=. --follow
+#
+#  La imagen resultante queda en el registry interno de OpenShift como:
+#    image-registry.openshift-image-registry.svc:5000/suiteacademica/suiteacademica:latest
+#
+#  El Deployment la referencia por su nombre corto y usa un ImageStreamTrigger
+#  para redeplegar automáticamente cuando hay nueva build.
+# ─────────────────────────────────────────────────────────────────────
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: suiteacademica
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+spec:
+  lookupPolicy:
+    local: true
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: suiteacademica
+  namespace: suiteacademica
+  labels:
+    app: suiteacademica
+spec:
+  source:
+    type: Binary
+    binary: {}        # el código vendrá por `oc start-build --from-dir=.`
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Containerfile
+  output:
+    to:
+      kind: ImageStreamTag
+      name: suiteacademica:latest
+  resources:
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  successfulBuildsHistoryLimit: 3
+  failedBuildsHistoryLimit: 3

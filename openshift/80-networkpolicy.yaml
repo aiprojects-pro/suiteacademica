@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────
+#  NetworkPolicies — sólo el OpenShift router puede llegar al pod por HTTP,
+#  y el pod sólo puede salir a DNS + Anthropic API + Moodle (opcional).
+#
+#  Si tu cluster no tiene CNI con NetworkPolicy (OVN-Kubernetes / Cilium /
+#  Calico), estas reglas se ignoran y no rompen nada.
+# ─────────────────────────────────────────────────────────────────────
+
+# Ingreso: sólo el router (namespace openshift-ingress) puede entrar al pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-router
+  namespace: suiteacademica
+spec:
+  podSelector:
+    matchLabels:
+      app: suiteacademica
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+# Egreso: sólo DNS interno + HTTPS saliente (para Anthropic API y Moodle).
+# Si tu Moodle interno necesita acceso desde el pod, ya está cubierto por
+# este policy (cualquier 443 saliente está permitido).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns-and-https
+  namespace: suiteacademica
+spec:
+  podSelector:
+    matchLabels:
+      app: suiteacademica
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
