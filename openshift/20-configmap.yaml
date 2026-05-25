@@ -32,7 +32,7 @@ data:
   # Maquetación (defaults seguros tras los fixes de F7)
   MAQ_SINGLE_CHARS: "18000"
   MAQ_CHUNK_CHARS: "18000"
-  MAQ_MAX_TOKENS: "32000"
+  MAQ_MAX_TOKENS: "16000"
   MAQ_CONCURRENCY: "3"
 
   # Monitoring y auditoría

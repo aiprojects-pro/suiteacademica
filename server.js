@@ -102,7 +102,10 @@ const BATCH_SIZE  = parseInt(process.env.BATCH_SIZE  || '25');
 const MAX_CHARS   = parseInt(process.env.MAX_CHARS   || '12000');
 const MAQ_CHUNK   = parseInt(process.env.MAQ_CHUNK_CHARS || '18000'); // tamaño de chunk para maquetación
 const MAQ_SINGLE  = parseInt(process.env.MAQ_SINGLE_CHARS || '18000'); // umbral para llamada única
-const MAQ_MAX_TOKENS = parseInt(process.env.MAQ_MAX_TOKENS || '32000'); // max_tokens para la maquetación (literal puede ser largo)
+// max_tokens para la maquetación. Por defecto 16000 (lo aceptan todos los modelos
+// claude-sonnet 4.x sin headers beta). Si tu modelo soporta más y quieres dar margen
+// para chunks grandes, subir vía env: MAQ_MAX_TOKENS=32000 (puede requerir header beta).
+const MAQ_MAX_TOKENS = parseInt(process.env.MAQ_MAX_TOKENS || '16000');
 const CACHE_TTL   = parseInt(process.env.CACHE_TTL_H || '4') * 3600000;
 const SESSION_MS  = parseInt(process.env.SESSION_HOURS || '8') * 3600000;
 const HISTORY_LIMIT = parseInt(process.env.HISTORY_LIMIT || '200');
@@ -1105,8 +1108,24 @@ function parseInWorker(type, buffer) {
 // ── Helpers de Claude ─────────────────────────────────────────────────────────
 const LETTERS = ['A','B','C','D','E'];
 async function callClaude(messages, maxTokens=8000) {
-  const r = await anthropic.messages.create({ model:MODEL, max_tokens:maxTokens, messages });
-  return r.content.filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
+  try {
+    // Usamos streaming SIEMPRE: el SDK de Anthropic rechaza llamadas no-streaming
+    // (`messages.create`) cuando estima que la respuesta puede tardar >10 minutos,
+    // con el error "Streaming is strongly recommended for operations that may take
+    // longer than 10 minutes". Eso pasa fácilmente con chunks de maquetación grandes
+    // o max_tokens altos. Con stream() acumulamos los deltas y devolvemos el texto
+    // final igual que la versión no-streaming, pero sin disparar el guardrail.
+    const stream = anthropic.messages.stream({ model:MODEL, max_tokens:maxTokens, messages });
+    const final = await stream.finalMessage();
+    return final.content.filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
+  } catch (err) {
+    // Log detallado al stderr del pod (para que el admin lo vea con `oc logs`).
+    const status = err?.status || err?.response?.status || 'n/a';
+    const apiErr = err?.error?.error?.message || err?.error?.message || err?.message || 'unknown';
+    console.error(`[claude] model=${MODEL} max_tokens=${maxTokens} status=${status} err=${apiErr}`);
+    // Re-lanzamos con un mensaje compacto que SÍ puede llegar al frontend.
+    throw new Error(`Claude API: ${status} ${apiErr.substring(0,160)}`);
+  }
 }
 function makeMessages(prompt, topic, textOverride=null, opts = {}) {
   // textOverride permite pasar un chunk específico en lugar de todo el texto.
@@ -2409,7 +2428,8 @@ app.post('/api/maqueta', aiLimiter, async (req, res) => {
     res.end();
   } catch(err) {
     console.error('[maqueta] error:', err.message);
-    send({ type:'error', message: 'Error procesando la maquetación.' });
+    // El cliente recibe el mensaje compacto (callClaude ya filtra detalles sensibles).
+    send({ type:'error', message: `Error procesando la maquetación: ${err.message}` });
     res.end();
   }
 });
@@ -2710,13 +2730,16 @@ app.post('/api/maqueta-docx', async (req, res) => {
 // como "tecnologÃ­as" (bytes UTF-8 leídos byte-a-byte como Latin-1).
 function fixMojibake(s) {
   if (typeof s !== 'string' || !s) return s;
-  // Si tiene marcadores típicos de mojibake (Ã seguido de ASCII low-ish) y al re-decodificar
-  // como UTF-8 sale algo "más limpio", devolvemos la versión re-decodificada.
+  // 1. Normalizar a NFC para corregir formas descompuestas que envía macOS Finder
+  //    (p.ej. "organizacioÌ n" — "o" + U+0301 combining acute — → "organización").
+  //    Esto es seguro: si ya está en NFC, normalize() no cambia nada.
+  s = s.normalize('NFC');
+
+  // 2. Si tiene marcadores típicos de mojibake (Ã seguido de ASCII low-ish) y al
+  //    re-decodificar como UTF-8 sale algo "más limpio", devolvemos esa versión.
   if (!/[ÃÂ]/.test(s)) return s;
   try {
-    const decoded = Buffer.from(s, 'latin1').toString('utf8');
-    // Heurística: si el re-decodificado contiene MENOS chars de mojibake que el original
-    // y al menos uno de los caracteres acentuados habituales, lo aceptamos.
+    const decoded = Buffer.from(s, 'latin1').toString('utf8').normalize('NFC');
     const before = (s.match(/[ÃÂ]/g) || []).length;
     const after  = (decoded.match(/[ÃÂ]/g) || []).length;
     if (after < before && /[áéíóúñÁÉÍÓÚÑ¿¡]/.test(decoded)) return decoded;
