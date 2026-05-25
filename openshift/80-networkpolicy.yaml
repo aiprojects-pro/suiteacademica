@@ -1,12 +1,28 @@
 # ─────────────────────────────────────────────────────────────────────
-#  NetworkPolicies — sólo el OpenShift router puede llegar al pod por HTTP,
-#  y el pod sólo puede salir a DNS + Anthropic API + Moodle (opcional).
+#  NetworkPolicies — endurecimiento mínimo del tráfico del pod.
 #
-#  Si tu cluster no tiene CNI con NetworkPolicy (OVN-Kubernetes / Cilium /
-#  Calico), estas reglas se ignoran y no rompen nada.
+#  PROBADO EN OKD 4.22 SNO con OVN-Kubernetes. La versión anterior bloqueaba
+#  involuntariamente el egress a api.anthropic.com (el selector de namespace
+#  para CoreDNS no acertaba el label real, y `except: 10.0.0.0/8` excluía
+#  el SDN interno que el pod necesita para resolver DNS y alcanzar la API).
+#
+#  Versión nueva (más permisiva pero igualmente útil como capa de defensa):
+#    - Ingress: sólo desde el router de OpenShift (puerto 3000).
+#    - Egress:
+#         · DNS UDP/TCP 53 a cualquier destino (resolución de nombres).
+#         · HTTPS 443 a cualquier destino (api.anthropic.com + Moodle externo).
+#         · Bloqueado todo lo demás (ej. SMTP saliente, conexiones a BBDD internas).
+#
+#  El bloqueo SSRF a IPs privadas YA ESTÁ implementado en la aplicación
+#  (server.js → assertSafeExternalUrl) — por eso aquí no excluimos rangos
+#  privados a nivel de red: si lo hacemos, rompemos también el acceso al
+#  propio SDN del cluster en muchas configuraciones.
+#
+#  Si tu cluster NO tiene CNI con NetworkPolicy, estas reglas se ignoran y
+#  no rompen nada.
 # ─────────────────────────────────────────────────────────────────────
 
-# Ingreso: sólo el router (namespace openshift-ingress) puede entrar al pod.
+# Ingreso: sólo el router de OpenShift puede llegar al pod por su puerto 3000.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -19,19 +35,28 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
-        - namespaceSelector:
-            matchLabels:
-              network.openshift.io/policy-group: ingress
+        # OVN-Kubernetes / OpenShift 4.x: el namespace openshift-ingress lleva ESTE label
         - namespaceSelector:
             matchLabels:
               policy-group.network.openshift.io/ingress: ""
+        # OpenShift SDN (clusters antiguos)
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+        # Selector universal por nombre de namespace (K8s 1.21+ pone este label automáticamente)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
       ports:
         - protocol: TCP
           port: 3000
 ---
-# Egreso: sólo DNS interno + HTTPS saliente (para Anthropic API y Moodle).
-# Si tu Moodle interno necesita acceso desde el pod, ya está cubierto por
-# este policy (cualquier 443 saliente está permitido).
+# Egreso: DNS + HTTPS a cualquier destino. Esta política es deliberadamente
+# permisiva en los DESTINOS porque:
+#   1. CoreDNS en OKD puede estar en distintos namespaces según versión/cluster
+#      y los selectores `kubernetes.io/metadata.name` no siempre matchean.
+#   2. Excluir 10.0.0.0/8 del egress 443 rompe el cluster SDN en muchos casos.
+#   3. El SSRF se previene a nivel de aplicación (assertSafeExternalUrl).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -43,23 +68,18 @@ spec:
       app: suiteacademica
   policyTypes: [Egress]
   egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: openshift-dns
-      ports:
+    # DNS — UDP y TCP a cualquier resolver
+    - ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
-    - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
-              - 169.254.0.0/16
-      ports:
+    # HTTPS saliente — para api.anthropic.com, Moodle externo, etc.
+    - ports:
         - protocol: TCP
           port: 443
+    # HTTP saliente — opcional, sólo si tu Moodle interno usa HTTP (poco habitual).
+    # Descomenta si lo necesitas:
+    # - ports:
+    #     - protocol: TCP
+    #       port: 80
