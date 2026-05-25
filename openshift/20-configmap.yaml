@@ -44,3 +44,11 @@ data:
   PARSE_TIMEOUT_MS: "30000"
   PARSE_MEM_LIMIT_MB: "512"
   USER_TOPIC_BUDGET_MB: "250"
+
+  # ── Proxy corporativo (DESCOMENTAR sólo si el cluster lo requiere) ────────
+  # Si el SNO tiene un proxy obligatorio para salir a Internet (típico en redes
+  # corporativas), defínelo aquí. El SDK de Anthropic (Node 22 con `fetch` nativo)
+  # respeta HTTPS_PROXY. NO_PROXY evita usar el proxy para tráfico interno del cluster.
+  # HTTPS_PROXY: "http://proxy.corp:3128"
+  # HTTP_PROXY: "http://proxy.corp:3128"
+  # NO_PROXY: ".cluster.local,.svc,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,localhost,127.0.0.1"

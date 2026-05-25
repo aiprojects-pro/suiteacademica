@@ -1107,24 +1107,51 @@ function parseInWorker(type, buffer) {
 
 // ── Helpers de Claude ─────────────────────────────────────────────────────────
 const LETTERS = ['A','B','C','D','E'];
-async function callClaude(messages, maxTokens=8000) {
+// Llamada a Claude con streaming. Es OBLIGATORIO usar streaming porque el SDK rechaza
+// llamadas no-streaming (`messages.create`) cuando estima que pueden tardar >10 min
+// ("Streaming is strongly recommended for operations that may take longer than 10 minutes").
+//
+// Iteramos los eventos del stream explícitamente para:
+//   - poder logear inicio/fin/errores con timing concreto
+//   - opcionalmente invocar onTick() para mantener viva una conexión SSE del cliente
+//     (evita que el router HAProxy de OKD corte la conexión por idle timeout)
+async function callClaude(messages, maxTokens = 8000, onTick = null) {
+  const t0 = Date.now();
+  const reqId = Math.random().toString(36).slice(2, 8);
+  let text = '';
+  let inputTokens = 0, outputTokens = 0;
   try {
-    // Usamos streaming SIEMPRE: el SDK de Anthropic rechaza llamadas no-streaming
-    // (`messages.create`) cuando estima que la respuesta puede tardar >10 minutos,
-    // con el error "Streaming is strongly recommended for operations that may take
-    // longer than 10 minutes". Eso pasa fácilmente con chunks de maquetación grandes
-    // o max_tokens altos. Con stream() acumulamos los deltas y devolvemos el texto
-    // final igual que la versión no-streaming, pero sin disparar el guardrail.
-    const stream = anthropic.messages.stream({ model:MODEL, max_tokens:maxTokens, messages });
-    const final = await stream.finalMessage();
-    return final.content.filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
+    console.log(`[claude ${reqId}] start model=${MODEL} max_tokens=${maxTokens}`);
+    const stream = anthropic.messages.stream({ model: MODEL, max_tokens: maxTokens, messages });
+
+    let lastTick = Date.now();
+    let chars = 0;
+    for await (const event of stream) {
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        text += event.delta.text;
+        chars = text.length;
+        // Invocar onTick cada 5 segundos máximo para no saturar el SSE
+        if (onTick && (Date.now() - lastTick) > 5000) {
+          try { onTick(chars); } catch (_) {}
+          lastTick = Date.now();
+        }
+      } else if (event.type === 'message_start') {
+        inputTokens = event.message?.usage?.input_tokens || 0;
+      } else if (event.type === 'message_delta') {
+        outputTokens = event.usage?.output_tokens || outputTokens;
+      } else if (event.type === 'error') {
+        throw new Error(event.error?.message || 'stream error');
+      }
+    }
+    const ms = Date.now() - t0;
+    console.log(`[claude ${reqId}] done ms=${ms} in=${inputTokens} out=${outputTokens} chars=${chars}`);
+    return text.trim();
   } catch (err) {
-    // Log detallado al stderr del pod (para que el admin lo vea con `oc logs`).
+    const ms = Date.now() - t0;
     const status = err?.status || err?.response?.status || 'n/a';
     const apiErr = err?.error?.error?.message || err?.error?.message || err?.message || 'unknown';
-    console.error(`[claude] model=${MODEL} max_tokens=${maxTokens} status=${status} err=${apiErr}`);
-    // Re-lanzamos con un mensaje compacto que SÍ puede llegar al frontend.
-    throw new Error(`Claude API: ${status} ${apiErr.substring(0,160)}`);
+    console.error(`[claude ${reqId}] FAIL ms=${ms} status=${status} err=${apiErr}`);
+    throw new Error(`Claude API: ${status} ${apiErr.substring(0, 160)}`);
   }
 }
 function makeMessages(prompt, topic, textOverride=null, opts = {}) {
@@ -2296,7 +2323,13 @@ app.post('/api/maqueta', aiLimiter, async (req, res) => {
       send({ type:'start', mode:'single', totalChunks:1 });
       send({ type:'progress', chunk:1, total:1, pct:20, label:'Analizando estructura del documento...' });
       const prompt = buildMaquetaPrompt({ hasImages, hasTables, chunkMode:false });
-      const raw = await callClaude(makeMessages(prompt, topic, null, { fullText: true }), MAQ_MAX_TOKENS);
+      // Heartbeat: cada ~5s mientras Claude responde, mandamos progreso al cliente
+      // para que el SSE no entre en idle y el router HAProxy no corte la conexión.
+      const onTick = (chars) => {
+        const approxPct = Math.min(80, 20 + Math.round(chars / 200));
+        send({ type:'progress', chunk:1, total:1, pct: approxPct, label: `Maquetando… (${chars.toLocaleString()} caracteres generados)` });
+      };
+      const raw = await callClaude(makeMessages(prompt, topic, null, { fullText: true }), MAQ_MAX_TOKENS, onTick);
       send({ type:'progress', chunk:1, total:1, pct:85, label:'Procesando respuesta...' });
       let data = parseMaqJson(raw);
       data = normalizeMaquetaData(data, {
@@ -2348,11 +2381,21 @@ app.post('/api/maqueta', aiLimiter, async (req, res) => {
           chunkInfo: useChunkMode ? `sección ${i+1} de ${chunks.length}` : null
         });
         const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}"${useChunkMode ? ` (sección ${i+1}/${chunks.length})` : ''}:\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
+        // Heartbeat: mientras este chunk corre, reportar al cliente que sigue vivo.
+        const onTick = (chars) => {
+          send({
+            type:'progress',
+            chunk: i+1,
+            total: chunks.length,
+            pct: Math.round((completed / chunks.length) * 92) + 4,
+            label: `Sección ${i+1}/${chunks.length} · ${chars.toLocaleString()} caracteres generados`
+          });
+        };
         // Hasta 2 reintentos si el parsing falla (max_tokens, JSON malformado puntual)
         let lastErr = null, data = null;
         for (let attempt = 0; attempt < 2 && !data; attempt++) {
           try {
-            const raw = await callClaude(msg, MAQ_MAX_TOKENS);
+            const raw = await callClaude(msg, MAQ_MAX_TOKENS, onTick);
             data = parseMaqJson(raw);
           } catch (e) {
             lastErr = e;
@@ -2469,7 +2512,12 @@ app.post('/api/maqueta-batch', aiLimiter, async (req, res) => {
       if (!useChunking) {
         send({ type:'topic_progress', ti, pct:30, label:'Analizando estructura...' });
         const prompt = buildMaquetaPrompt({ hasImages, hasTables, chunkMode:false });
-        const raw = await callClaude(makeMessages(prompt, topic, null, { fullText: true }), MAQ_MAX_TOKENS);
+        const onTick = (chars) => send({
+          type:'topic_progress', ti,
+          pct: Math.min(75, 30 + Math.round(chars / 400)),
+          label: `Maquetando… (${chars.toLocaleString()} caracteres)`
+        });
+        const raw = await callClaude(makeMessages(prompt, topic, null, { fullText: true }), MAQ_MAX_TOKENS, onTick);
         const data = parseMaqJson(raw);
         send({ type:'topic_progress', ti, pct:80, label:'Normalizando resultado...' });
         finalData = normalizeMaquetaData(data, {
@@ -2491,10 +2539,15 @@ app.post('/api/maqueta-batch', aiLimiter, async (req, res) => {
               chunkInfo: useChunkMode ? `sección ${i+1} de ${chunks.length}` : null
             });
             const msg = [{ role:'user', content:`CONTENIDO DE "${topic.name}"${useChunkMode ? ` (sección ${i+1}/${chunks.length})` : ''}:\n---\n${chunks[i]}\n---\n\n${chunkPrompt}` }];
+            const onTick = (chars) => send({
+              type:'topic_progress', ti,
+              pct: 5 + Math.round((completed / chunks.length) * 85),
+              label: `Sección ${i+1}/${chunks.length} · ${chars.toLocaleString()} caracteres`
+            });
             let lastErr = null, data = null;
             for (let attempt = 0; attempt < 2 && !data; attempt++) {
               try {
-                const raw = await callClaude(msg, MAQ_MAX_TOKENS);
+                const raw = await callClaude(msg, MAQ_MAX_TOKENS, onTick);
                 data = parseMaqJson(raw);
               } catch(e) { lastErr = e; }
             }

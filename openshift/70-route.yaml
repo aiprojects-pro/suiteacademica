@@ -1,11 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────
-#  Route con TLS edge termination.
-#  El cluster proporciona el certificado (wildcard *.apps.<cluster>.<domain>).
+#  Route con TLS edge termination + anotaciones HAProxy para SSE largo.
 #
-#  CAMBIA `host:` por el FQDN real que quieras (o déjalo vacío y OKD
-#  asignará uno autogenerado del wildcard de apps).
+#  CRÍTICO PARA SSE EN OKD:
+#    - timeout (cliente HTTP)
+#    - timeout-tunnel (conexión persistente sin actividad — el más importante para SSE
+#      mientras Claude tarda en empezar a streamear)
+#    - hsts-header opcional
 #
-#  insecureEdgeTerminationPolicy: Redirect → HTTP→HTTPS automático.
+#  Los timeouts deben ser >= max tiempo que tarda Anthropic en empezar a responder.
+#  Para máquetar un chunk grande con un modelo lento → 10 min es prudente.
 # ─────────────────────────────────────────────────────────────────────
 apiVersion: route.openshift.io/v1
 kind: Route
@@ -15,12 +18,19 @@ metadata:
   labels:
     app: suiteacademica
   annotations:
-    # SSE necesita timeout largo en el router HAProxy del cluster
+    # Timeout TOTAL de la conexión cliente↔router. Para SSE prolongado.
     haproxy.router.openshift.io/timeout: "10m"
-    # No bufferizar respuestas (para que el SSE llegue en streaming)
+    # Timeout en MODO TÚNEL (conexión persistente sin tráfico). El más importante:
+    # si no hay datos en este intervalo, HAProxy cierra. Con los heartbeats SSE
+    # del servidor (cada ~5s) nunca se llega aquí, pero lo subimos por seguridad.
+    haproxy.router.openshift.io/timeout-tunnel: "10m"
+    # Algoritmo de balanceo (irrelevante en SNO con 1 réplica, pero explícito).
     haproxy.router.openshift.io/balance: "leastconn"
+    # Sticky session no necesaria (el cookie de sesión va por nuestra cookie,
+    # no por la del router) — la desactivamos explícitamente.
+    haproxy.router.openshift.io/disable_cookies: "true"
 spec:
-  # host: suiteacademica.apps.<cluster>.<domain>   ← descomenta y ajusta si quieres FQDN específico
+  # host: suiteacademica.apps.<cluster>.<domain>   ← descomenta para FQDN específico
   to:
     kind: Service
     name: suiteacademica

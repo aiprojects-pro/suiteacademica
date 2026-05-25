@@ -267,6 +267,93 @@ el pod si necesitas desactivarlo temporalmente.
 
 ---
 
+## Diagnóstico específico del flujo de maquetación
+
+La maquetación es el endpoint más sensible porque combina (a) un SSE de larga
+duración entre cliente y pod, (b) una llamada streaming a `api.anthropic.com`,
+y (c) puede generar mucho output (chunks grandes).
+
+### "Piensa pero no maqueta" — qué mirar
+
+1. **¿Sube el contador de caracteres en pantalla?** El cliente recibe heartbeats
+   cada ~5 s mientras Claude responde, con texto del tipo
+   `"Sección 1/2 · 12.345 caracteres generados"`.
+   - **Sí avanza** → la API funciona y el SSE llega. Si al final falla, mira
+     `parseMaqJson` en logs (JSON inválido del modelo).
+   - **No avanza ni un solo carácter** → el stream nunca empezó. Sigue al paso 2.
+
+2. **Logs del pod durante un intento**:
+   ```bash
+   oc logs -f deployment/suiteacademica -n suiteacademica
+   ```
+   Dispara una maquetación. Esperar:
+   - `[claude abc123] start model=... max_tokens=16000`
+   - (silencio mientras Claude genera)
+   - `[claude abc123] done ms=23456 in=2100 out=8400 chars=18500`
+
+   Si NO aparece `start` → la petición ni llegó a Anthropic. Pasa al paso 3.
+   Si aparece `start` pero nunca `done` ni `FAIL` → cuelgue real del stream.
+   Si aparece `FAIL ms=... status=... err=...` → ese es el error exacto.
+
+3. **¿El pod tiene salida a `api.anthropic.com`?**
+   ```bash
+   oc rsh deployment/suiteacademica -n suiteacademica
+   # dentro del pod (UID asignado por SCC):
+   node -e "fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'x-api-key':'invalid','anthropic-version':'2023-06-01','content-type':'application/json'},body:'{}'}).then(r=>console.log('HTTP',r.status)).catch(e=>console.log('ERR',e.message))"
+   ```
+   - `HTTP 401` → la red sale OK (Anthropic responde "invalid key").
+   - `ERR ENOTFOUND` → DNS no resuelve `api.anthropic.com`.
+   - `ERR ETIMEDOUT` → la red no llega (firewall corporativo, proxy obligatorio…).
+   - `ERR EHOSTUNREACH` o similar → revisar NetworkPolicy y egress del cluster.
+
+   Si hay un **proxy corporativo**, edita `openshift/20-configmap.yaml`,
+   descomenta las líneas `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` y reinicia:
+   ```bash
+   oc apply -f openshift/20-configmap.yaml
+   oc rollout restart deployment/suiteacademica
+   ```
+
+4. **¿El router HAProxy corta el SSE?** Comprobar las anotaciones de la Route:
+   ```bash
+   oc get route suiteacademica -o yaml | grep -A1 annotations
+   ```
+   Debe tener al menos:
+   ```
+   haproxy.router.openshift.io/timeout: 10m
+   haproxy.router.openshift.io/timeout-tunnel: 10m
+   ```
+   Si faltan, aplica el manifest:
+   ```bash
+   oc apply -f openshift/70-route.yaml
+   ```
+
+5. **¿La NetworkPolicy bloquea egress?** Si tu cluster tiene OVN-Kubernetes
+   o Calico con NetworkPolicy activa, comprueba que el egress a 443 funciona:
+   ```bash
+   oc get networkpolicy -n suiteacademica
+   # debería listar `allow-egress-dns-and-https`
+   ```
+   Si **temporalmente** quieres descartar la NetworkPolicy como causa:
+   ```bash
+   oc delete networkpolicy allow-egress-dns-and-https -n suiteacademica
+   # tras diagnóstico, vuelve a aplicarla:
+   oc apply -f openshift/80-networkpolicy.yaml
+   ```
+
+### "Sección sin maquetar" en el docx final
+
+Si el docx tiene bloques `⚠ No se pudo maquetar automáticamente esta sección
+(motivo)`, ese mensaje es el **motivo real del fallo**. Casos típicos:
+
+| Motivo en el docx | Diagnóstico |
+|-------------------|-------------|
+| "Streaming is strongly recommended for operations that may take longer than 10 minutes" | El SDK rechaza la llamada non-streaming. Ya corregido en v8.1+ (usamos `messages.stream`). Si lo ves, la versión desplegada está obsoleta — re-construye con `oc start-build --from-dir=.` |
+| "Claude API: 400 max_tokens..." | El modelo no admite ese `max_tokens`. Bajar `MAQ_MAX_TOKENS` en el ConfigMap. |
+| "Claude API: 401 ..." | API key inválida. Revisar Secret `ANTHROPIC_API_KEY`. |
+| "Claude API: 404 model not found" | El nombre del modelo no existe. Revisar ConfigMap `ANTHROPIC_MODEL`. |
+| "Claude API: 429 ..." | Cuota de Anthropic agotada o rate-limit. Esperar / subir plan. |
+| "JSON inválido: ..." | Claude devolvió texto que no es JSON parseable. Suele resolverse con un reintento — el código ya hace 2 intentos. Si persiste, el prompt necesita ajuste. |
+
 ## Diagnóstico de problemas
 
 ### El pod no arranca
