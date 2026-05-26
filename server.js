@@ -327,7 +327,17 @@ function estimateTopicBytes(topic) {
 // Inserta un topic en el cache asociado al usuario, expulsando los más antiguos del MISMO usuario
 // si supera la cuota. Nunca toca topics de otros usuarios.
 function addToTopicCache(userId, id, topic) {
+  // Defensa crítica: si userId es falsy (undefined/null), NO almacenamos el topic.
+  // De lo contrario, dos peticiones sin user válido podrían compartir cache.
+  if (!userId || typeof userId !== 'string') {
+    throw new Error('addToTopicCache: userId obligatorio');
+  }
   const bytes = estimateTopicBytes(topic);
+  // Si un solo topic supera el budget completo, rechazamos antes de caer en
+  // memoria. Mejor un 413 al cliente que un OOM diferido del proceso.
+  if (bytes > USER_TOPIC_BUDGET_BYTES) {
+    throw new Error(`Documento demasiado grande para el cache (${Math.round(bytes/1024/1024)} MB > ${Math.round(USER_TOPIC_BUDGET_BYTES/1024/1024)} MB).`);
+  }
   topicCache.set(id, { ...topic, ts: Date.now(), userId, bytes });
   let total = 0;
   const owned = [];
@@ -344,14 +354,18 @@ function addToTopicCache(userId, id, topic) {
   }
 }
 
-setInterval(() => { const n=Date.now(); for(const[id,e] of topicCache) if(n-e.ts>CACHE_TTL) topicCache.delete(id); }, 3600000);
+// `.unref()` para que el timer no impida un shutdown gracioso (SIGTERM).
+setInterval(() => { const n=Date.now(); for(const[id,e] of topicCache) if(n-e.ts>CACHE_TTL) topicCache.delete(id); }, 3600000).unref();
 
 // Devuelve el topic SOLO si pertenece al usuario que hace la petición.
+// Defensa crítica: rechazar si cualquiera de los dos userId es falsy (evita
+// `undefined === undefined` permitiendo acceso cruzado sin sesión válida).
 function getOwnedTopic(req, id) {
   if (typeof id !== 'string' || id.length < 8) return null;
   const t = topicCache.get(id);
   if (!t) return null;
-  if (t.userId !== req.user?.id) return null;
+  const reqUid = req.user?.id;
+  if (!reqUid || !t.userId || t.userId !== reqUid) return null;
   return t;
 }
 
@@ -555,27 +569,23 @@ function requireAuth(req, res, next) {
     return res.redirect('/login?msg=session_expired');
   }
   req.user = user;
+  // Helper: permite GETs a assets estáticos (HTML, JS, CSS, fuentes, imágenes) para
+  // que la SPA cargue correctamente aun bajo bloqueo de mustChange / mustEnable2FA.
+  const isAssetGet = req.method === 'GET' && (
+    req.path === '/' ||
+    req.path === '/index.html' ||
+    req.path === '/app.js' ||
+    /\.(css|js|woff2?|ttf|otf|png|jpg|jpeg|gif|svg|ico|webp)$/i.test(req.path)
+  );
+
   // Si el usuario debe cambiar la contraseña, sólo permitimos las rutas mínimas
   if (user.mustChangePassword && !PASSWORD_GRACE_PATHS.has(req.path)) {
-    if (req.method === 'GET' && (
-      req.path === '/' ||
-      req.path === '/index.html' ||
-      req.path === '/app.js'
-    )) {
-      // Permitimos cargar el frontend para que muestre el formulario de cambio
-      return next();
-    }
+    if (isAssetGet) return next();
     return res.status(403).json({ error: 'Debes cambiar la contraseña antes de continuar.', mustChangePassword: true });
   }
   // Si REQUIRE_TOTP_FOR_ADMINS y es admin sin 2FA, sólo permitimos rutas para activarlo
   if (REQUIRE_TOTP_FOR_ADMINS && user.role === 'admin' && !user.totpEnabled && !TOTP_GRACE_PATHS.has(req.path)) {
-    if (req.method === 'GET' && (
-      req.path === '/' ||
-      req.path === '/index.html' ||
-      req.path === '/app.js'
-    )) {
-      return next();
-    }
+    if (isAssetGet) return next();
     return res.status(403).json({ error: 'Como administrador debes activar 2FA antes de continuar.', mustEnable2FA: true });
   }
   next();
@@ -910,7 +920,20 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
     console.warn('[change-password] session revoke error:', e.message);
   }
 
-  res.json({ success:true });
+  // Regenerar también la sesión ACTUAL y rotar CSRF. Si un atacante hubiera robado
+  // la cookie de sesión actual, queda fuera junto con todas las demás.
+  const uid = req.user.id;
+  req.session.regenerate((err) => {
+    if (err) {
+      console.warn('[change-password] regenerate error:', err.message);
+      return res.json({ success:true });
+    }
+    req.session.userId = uid;
+    const csrfTok = crypto.randomBytes(32).toString('base64url');
+    res.cookie('csrf', csrfTok, CSRF_COOKIE_OPTS);
+    res.setHeader('X-CSRF-Token', csrfTok);
+    req.session.save(() => res.json({ success:true }));
+  });
 });
 
 // ── 2FA TOTP ─────────────────────────────────────────────────────────────────
@@ -1062,14 +1085,6 @@ function detectFileSignature(buf) {
   return null;
 }
 
-// Envuelve una promesa con un timeout que la rechaza si tarda demasiado.
-function withTimeout(promise, ms, label = 'operación') {
-  let to;
-  const timer = new Promise((_, reject) => {
-    to = setTimeout(() => reject(new Error(`${label}: tiempo agotado`)), ms);
-  });
-  return Promise.race([promise, timer]).finally(() => clearTimeout(to));
-}
 const PARSE_TIMEOUT_MS  = parseInt(process.env.PARSE_TIMEOUT_MS || '30000');
 const PARSE_MEM_LIMIT_MB = parseInt(process.env.PARSE_MEM_LIMIT_MB || '512');
 
@@ -1078,29 +1093,35 @@ const PARSE_MEM_LIMIT_MB = parseInt(process.env.PARSE_MEM_LIMIT_MB || '512');
 // Si el worker excede memoria, Node lo termina y aquí cae a un reject limpio.
 function parseInWorker(type, buffer) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      try { fn(value); } catch (_) {}
+    };
+
     const w = new Worker(path.join(__dirname, 'workers', 'parser-worker.js'), {
       workerData: { type, buffer },
       resourceLimits: { maxOldGenerationSizeMb: PARSE_MEM_LIMIT_MB }
     });
     const killTimer = setTimeout(() => {
-      reject(new Error(`worker ${type}: tiempo agotado`));
+      finish(reject, new Error(`worker ${type}: tiempo agotado`));
       w.terminate().catch(() => {});
     }, PARSE_TIMEOUT_MS);
 
     w.once('message', (msg) => {
-      clearTimeout(killTimer);
+      if (msg && msg.ok) finish(resolve, msg.data);
+      else finish(reject, new Error((msg && msg.error) || 'worker: error desconocido'));
+      // Tras settle, terminamos el worker. El evento `exit` posterior verá settled=true y no hará nada.
       w.terminate().catch(() => {});
-      if (msg && msg.ok) resolve(msg.data);
-      else reject(new Error((msg && msg.error) || 'worker: error desconocido'));
     });
-    w.once('error', (err) => {
-      clearTimeout(killTimer);
-      reject(err);
-    });
+    w.once('error', (err) => finish(reject, err));
     w.once('exit', (code) => {
-      clearTimeout(killTimer);
-      // Si el worker terminó sin enviar mensaje (memory limit, kill...) cae aquí.
-      if (code !== 0) reject(new Error(`worker ${type}: terminado con código ${code}`));
+      // Si el worker terminó sin haber enviado message (memory limit, kill externo...),
+      // settled aún es false y caemos aquí. Tras un `message` OK, settled ya es true y `finish` no hace nada.
+      if (code !== 0) finish(reject, new Error(`worker ${type}: terminado con código ${code}`));
+      else finish(reject, new Error(`worker ${type}: terminado sin enviar resultado`));
     });
   });
 }
@@ -1120,9 +1141,10 @@ async function callClaude(messages, maxTokens = 8000, onTick = null) {
   const reqId = Math.random().toString(36).slice(2, 8);
   let text = '';
   let inputTokens = 0, outputTokens = 0;
+  let stream;
   try {
     console.log(`[claude ${reqId}] start model=${MODEL} max_tokens=${maxTokens}`);
-    const stream = anthropic.messages.stream({ model: MODEL, max_tokens: maxTokens, messages });
+    stream = anthropic.messages.stream({ model: MODEL, max_tokens: maxTokens, messages });
 
     let lastTick = Date.now();
     let chars = 0;
@@ -1130,7 +1152,6 @@ async function callClaude(messages, maxTokens = 8000, onTick = null) {
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
         text += event.delta.text;
         chars = text.length;
-        // Invocar onTick cada 5 segundos máximo para no saturar el SSE
         if (onTick && (Date.now() - lastTick) > 5000) {
           try { onTick(chars); } catch (_) {}
           lastTick = Date.now();
@@ -1140,7 +1161,8 @@ async function callClaude(messages, maxTokens = 8000, onTick = null) {
       } else if (event.type === 'message_delta') {
         outputTokens = event.usage?.output_tokens || outputTokens;
       } else if (event.type === 'error') {
-        throw new Error(event.error?.message || 'stream error');
+        const t = event.error?.type ? `${event.error.type}: ` : '';
+        throw new Error(t + (event.error?.message || 'stream error'));
       }
     }
     const ms = Date.now() - t0;
@@ -1152,6 +1174,10 @@ async function callClaude(messages, maxTokens = 8000, onTick = null) {
     const apiErr = err?.error?.error?.message || err?.error?.message || err?.message || 'unknown';
     console.error(`[claude ${reqId}] FAIL ms=${ms} status=${status} err=${apiErr}`);
     throw new Error(`Claude API: ${status} ${apiErr.substring(0, 160)}`);
+  } finally {
+    // Abortar el stream para liberar el fetch subyacente y dejar de consumir tokens
+    // si salimos por error o por cierre del cliente (req.on('close')).
+    try { stream?.controller?.abort(); } catch (_) {}
   }
 }
 function makeMessages(prompt, topic, textOverride=null, opts = {}) {
@@ -1251,12 +1277,26 @@ function mkBrd(c,sz=4){return{style:BorderStyle.SINGLE,size:sz,color:c};}
 
 
 // ── Word document helpers ─────────────────────────────────────────────────────
+// Genera la config de `numbering` para el Document. Cada `ol` del cuerpo necesita
+// su PROPIA reference para que la numeraci\u00f3n se reinicie a 1 (docx-js comparte
+// el contador si dos listas usan la misma reference). El frontend marcar\u00e1 cada
+// `ol` con un `_numRef` \u00fanico antes de invocar makeDoc.
+function buildNumberingConfig(numberedListCount = 0) {
+  const config = [
+    {reference:'bullets',levels:[{level:0,format:LevelFormat.BULLET,text:'\u2022',alignment:AlignmentType.LEFT,style:{paragraph:{indent:{left:720,hanging:360}},run:{font:'Arial',size:22}}}]}
+  ];
+  for (let i = 0; i < Math.max(1, numberedListCount); i++) {
+    config.push({
+      reference: `numbers-${i}`,
+      levels: [{level:0,format:LevelFormat.DECIMAL,text:'%1.',alignment:AlignmentType.LEFT,style:{paragraph:{indent:{left:720,hanging:360}},run:{font:'Arial',size:22}}}]
+    });
+  }
+  return config;
+}
+
 function makeDoc(children, name, footerTxt, colorT, colorL, extra={}) {
   return new Document({
-    numbering:{config:[
-      {reference:'bullets',levels:[{level:0,format:LevelFormat.BULLET,text:'\u2022',alignment:AlignmentType.LEFT,style:{paragraph:{indent:{left:720,hanging:360}},run:{font:'Arial',size:22}}}]},
-      {reference:'numbers',levels:[{level:0,format:LevelFormat.DECIMAL,text:'%1.',alignment:AlignmentType.LEFT,style:{paragraph:{indent:{left:720,hanging:360}},run:{font:'Arial',size:22}}}]}
-    ]},
+    numbering:{config: buildNumberingConfig(extra.numberedListCount)},
     styles:{default:{document:{run:{font:'Arial',size:22}}},paragraphStyles:[
       {id:'Heading1',name:'Heading 1',basedOn:'Normal',next:'Normal',quickFormat:true,run:{size:extra.h1Size||36,bold:true,font:'Arial',color:colorT},paragraph:{spacing:{before:0,after:360},outlineLevel:0}},
       {id:'Heading2',name:'Heading 2',basedOn:'Normal',next:'Normal',quickFormat:true,run:{size:extra.h2Size||26,bold:true,font:'Arial',color:extra.h2Color||'2E75B6'},paragraph:{spacing:{before:300,after:100},outlineLevel:1}},
@@ -1293,8 +1333,55 @@ function buildSummaryDoc(name, text) {
   return makeDoc(children,cn,'Resumen generado automáticamente',CT,CL);
 }
 
+// Quita marcadores de lista al inicio del texto. El modelo a veces incluye el
+// prefijo "a)", "1.", "•", etc. EN el texto del item aunque ya lo marca como ul/ol.
+// Sin esta limpieza, el documento muestra "• a) Texto" (doble viñeta) o "1. 1. Texto".
+//
+// CONSERVADOR: si tras quitar el marcador el texto restante es demasiado corto
+// (< 4 chars significativos), NO lo quitamos: probablemente NO era un marcador,
+// sino el texto completo (p.ej. un item legítimo cuyo contenido es solo "i)" como
+// referencia interna). Mejor pecar de respetar el original que destruir texto.
+function stripListMarker(s) {
+  if (typeof s !== 'string') return s;
+  const original = s.trim();
+  let out = original;
+  for (let i = 0; i < 3; i++) {
+    const before = out;
+    const candidate = out
+      .replace(/^[•·▪◦●▶➤–\-*]\s+/, '')          // viñetas comunes
+      .replace(/^\(?[a-zA-Z]\)\s+/, '')           // a)  (a)  b)  (b)
+      .replace(/^[ivxlcdm]{1,5}\)\s+/i, '')       // i) ii) iii) iv)
+      .replace(/^\d+\)\s+/, '')                   // 1) 2) 3)
+      .replace(/^\d+\.\-?\s+/, '')                // 1.  1.-
+      .replace(/^\d+[ºª]\.?\s+/, '')              // 1º 2º
+      .replace(/^→\s+/, '');                      // → (flecha)
+    // Si el strip dejó algo razonable (≥ 4 chars), lo aceptamos. Si no, paramos.
+    if (candidate.length >= 4 && candidate !== before) out = candidate;
+    else break;
+  }
+  return out;
+}
+
+// Asigna a cada bloque `ol` del documento una reference única para que la
+// numeración reinicie a 1 en cada lista. Devuelve el número total de listas
+// numeradas (para que `buildNumberingConfig` genere las references suficientes).
+function assignNumberingRefs(blocks) {
+  let count = 0;
+  for (const b of blocks) {
+    if (b && b.t === 'ol' && Array.isArray(b.items) && b.items.length) {
+      b._numRef = `numbers-${count}`;
+      count++;
+    }
+  }
+  return count;
+}
+
 // ── Maquetación: Word con colores personalizables (plantilla) ─────────────────
 function buildMaquetadoDoc(data, imageStore, tableStore, colors, quiz) {
+  // Asignar references de numeración únicas por cada `ol` (problema: la
+  // numeración continúa entre listas si comparten reference).
+  const numberedListCount = assignNumberingRefs(data.blocks || []);
+
   // colors es un objeto de la plantilla aplicada
   const C = colors || DEFAULT_TEMPLATES[0].colors;
   const CH1 = C.h1, CH2 = C.h2, CH3 = C.h3;
@@ -1409,10 +1496,15 @@ function buildMaquetadoDoc(data, imageStore, tableStore, colors, quiz) {
         alignment:AlignmentType.JUSTIFIED
       }));
     } else if ((t === 'ul' || t === 'ol') && Array.isArray(items)) {
+      // Cada `ol` usa su propia reference para que la numeración reinicie a 1.
+      // El bloque ya viene anotado con `_numRef` desde el paso de pre-render.
+      const reference = t === 'ul' ? 'bullets' : (block._numRef || 'numbers-0');
       for (const item of items) {
+        const cleanText = stripListMarker(item).trim();
+        if (!cleanText) continue;
         children.push(new Paragraph({
-          numbering:{reference:t==='ul'?'bullets':'numbers',level:0},
-          children:[new TextRun({text:ensurePeriod(item.trim()),font:'Arial',size:22})],
+          numbering:{reference, level:0},
+          children:[new TextRun({text:ensurePeriod(cleanText),font:'Arial',size:22})],
           spacing:{before:0,after:80}
         }));
       }
@@ -1453,7 +1545,8 @@ function buildMaquetadoDoc(data, imageStore, tableStore, colors, quiz) {
   return makeDoc(children, data.title || 'Documento',
     null, // sin texto en el pie: solo número de página
     CBD, CBD,
-    { h1Size:30, h1Color:CH1, h2Size:26, h2Color:CH2, h3Size:24, h3Color:CH3, headerColor:HDR }
+    { h1Size:30, h1Color:CH1, h2Size:26, h2Color:CH2, h3Size:24, h3Color:CH3, headerColor:HDR,
+      numberedListCount }
   );
 }
 
@@ -1677,6 +1770,10 @@ function buildMaquetaPrompt(options = {}) {
 ═══ REGLA #5 — LISTAS ═══
 - Listas con viñetas (ul) para enumeraciones no ordenadas y listas numeradas (ol) para pasos o secuencias.
 - Cada item termina en punto.
+- NUNCA incluyas el marcador de lista DENTRO del texto del item: si lo marcas como "ul", NO escribas "a) Texto" ni "• Texto" — escribe sólo "Texto". El renderizador añade el marcador. Lo contrario produce doble viñeta ("• a) Texto").
+- Ejemplo CORRECTO  : {"t":"ul","items":["Ubicación territorial.","Titularidad."]}
+- Ejemplo INCORRECTO: {"t":"ul","items":["a) Ubicación territorial.","b) Titularidad."]}
+- Cada bloque "ol" arranca con numeración 1, 2, 3… INDEPENDIENTE de listas anteriores. NO continúes la numeración entre listas: si dos artículos del temario tienen cada uno su propia enumeración, son DOS bloques "ol" distintos, no uno solo.
 
 ═══ REGLA #6 — TRANSICIONES ENTRE TÍTULOS CONSECUTIVOS ═══
 - Si tras un h1, h2 o h3 NO hay contenido sustancial original antes del siguiente h2/h3 (es decir, dos títulos consecutivos sin texto entre ellos), añade un BREVE párrafo introductorio (1-3 frases) de cosecha propia que presente brevemente el contenido del subapartado siguiente y enlace con la sección anterior. Marca este párrafo con "auto":true para identificarlo.
@@ -2030,13 +2127,19 @@ app.post('/api/generate', aiLimiter, async (req, res) => {
   res.setHeader('X-Accel-Buffering','no');
   res.flushHeaders();
 
-  const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
+  let clientAborted = false;
+  req.on('close', () => { clientAborted = true; });
+
+  const send = d => {
+    if (clientAborted) return;
+    try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){}
+  };
   const { topicIds, config } = req.body || {};
   if (!Array.isArray(topicIds) || !topicIds.length || !config || typeof config !== 'object') {
     send({type:'error',message:'Parámetros inválidos.'}); return res.end();
   }
   if (topicIds.length > MAX_TOPICS) { send({type:'error',message:'Demasiados temas.'}); return res.end(); }
-  const topics = topicIds.map(id => getOwnedTopic(req, id)).filter(Boolean);
+  const topics = topicIds.filter(id => typeof id === "string").map(id => getOwnedTopic(req, id)).filter(Boolean);
   if (!topics.length) { send({type:'error',message:'Temas no encontrados.'}); return res.end(); }
 
   const perTopic = config.generationMode === 'pertopic';
@@ -2122,6 +2225,7 @@ app.post('/api/generate', aiLimiter, async (req, res) => {
           for (const {p, n:polN} of getPolarities(diffQ)) {
             let emitted = 0;
             while (emitted < polN) {
+              if (clientAborted) return;
               const bQ = Math.min(BATCH_SIZE, polN - emitted);
               done++;
               send({
@@ -2167,18 +2271,25 @@ app.post('/api/summarize', aiLimiter, async (req, res) => {
   res.setHeader('X-Accel-Buffering','no');
   res.flushHeaders();
 
-  const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
+  let clientAborted = false;
+  req.on('close', () => { clientAborted = true; });
+
+  const send = d => {
+    if (clientAborted) return;
+    try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){}
+  };
   const { topicIds, pages } = req.body || {};
   if (!Array.isArray(topicIds) || !topicIds.length) { send({type:'error',message:'Temas no recibidos.'}); return res.end(); }
   if (topicIds.length > MAX_TOPICS) { send({type:'error',message:'Demasiados temas.'}); return res.end(); }
   const pagesNum = Math.max(1, Math.min(50, parseInt(pages) || 1));
-  const topics = topicIds.map(id => getOwnedTopic(req, id)).filter(Boolean);
+  const topics = topicIds.filter(id => typeof id === "string").map(id => getOwnedTopic(req, id)).filter(Boolean);
   if (!topics.length) { send({type:'error',message:'Temas no encontrados.'}); return res.end(); }
   const tw = pagesNum * 480;
   send({ type:'start', total:topics.length });
 
   try {
     for (let i = 0; i < topics.length; i++) {
+      if (clientAborted) return;
       const topic = topics[i];
       send({ type:'progress', current:i+1, total:topics.length, name:topic.name });
       const prompt = `Genera un resumen académico exhaustivo con aproximadamente ${tw} palabras (${pagesNum} páginas Word). Organízalo con SUBTÍTULOS EN MAYÚSCULAS para cada bloque temático. Cubre TODOS los conceptos. Español académico correcto. Todos los párrafos deben terminar con punto. Alcanza los ${tw} palabras.`;
@@ -2306,7 +2417,14 @@ app.post('/api/maqueta', aiLimiter, async (req, res) => {
   res.setHeader('X-Accel-Buffering','no');
   res.flushHeaders();
 
-  const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
+  // Si el cliente cierra la pestaña, dejamos de invocar a Claude para no gastar tokens.
+  let clientAborted = false;
+  req.on('close', () => { clientAborted = true; });
+
+  const send = d => {
+    if (clientAborted) return;
+    try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){}
+  };
   const { topicId } = req.body || {};
   const topic = getOwnedTopic(req, topicId);
   if (!topic) { send({type:'error',message:'Tema no encontrado.'}); return res.end(); }
@@ -2367,6 +2485,7 @@ app.post('/api/maqueta', aiLimiter, async (req, res) => {
     let nextIdx = 0;
     async function worker() {
       while (nextIdx < chunks.length) {
+        if (clientAborted) return; // cliente cerró → no consumir más Claude API
         const i = nextIdx++;
         send({
           type:'progress',
@@ -2438,6 +2557,14 @@ app.post('/api/maqueta', aiLimiter, async (req, res) => {
     const failedCount = results.filter(r => r && r._failed).length;
     const truncatedCount = results.filter(r => r && r._truncated).length;
 
+    // Si TODOS los chunks fallaron, no devolvemos un docx degradado silenciosamente:
+    // emitimos error explícito para que el cliente lo muestre y no genere un docx
+    // que sólo contiene texto crudo de fallback.
+    if (failedCount === chunks.length && failedCount > 0) {
+      send({ type:'error', message: 'No se pudo maquetar ninguna sección. Revisa la conexión con Claude.' });
+      return res.end();
+    }
+
     // Unificar resultados conservando el ORDEN de los chunks
     const allBlocks = [];
     let finalTitle = '';
@@ -2485,20 +2612,27 @@ app.post('/api/maqueta-batch', aiLimiter, async (req, res) => {
   res.setHeader('X-Accel-Buffering','no');
   res.flushHeaders();
 
-  const send = d => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){} };
+  let clientAborted = false;
+  req.on('close', () => { clientAborted = true; });
+
+  const send = d => {
+    if (clientAborted) return;
+    try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch(_){}
+  };
   const { topicIds } = req.body || {};
   if (!Array.isArray(topicIds) || !topicIds.length) {
     send({type:'error', message:'Sin documentos seleccionados.'});
     return res.end();
   }
   if (topicIds.length > MAX_TOPICS) { send({type:'error', message:'Demasiados temas.'}); return res.end(); }
-  const topics = topicIds.map(id => getOwnedTopic(req, id)).filter(Boolean);
+  const topics = topicIds.filter(id => typeof id === "string").map(id => getOwnedTopic(req, id)).filter(Boolean);
   if (!topics.length) { send({type:'error', message:'Temas no encontrados.'}); return res.end(); }
 
   send({ type:'batch_start', total: topics.length });
   const results = [];
 
   for (let ti = 0; ti < topics.length; ti++) {
+    if (clientAborted) break;
     const topic = topics[ti];
     send({ type:'topic_start', ti, name:topic.name, total: topics.length });
 
@@ -2533,6 +2667,7 @@ app.post('/api/maqueta-batch', aiLimiter, async (req, res) => {
         let completed = 0, nextIdx = 0;
         async function worker() {
           while (nextIdx < chunks.length) {
+            if (clientAborted) return;
             const i = nextIdx++;
             const chunkPrompt = buildMaquetaPrompt({
               hasImages, hasTables, chunkMode: useChunkMode,
