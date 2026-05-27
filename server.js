@@ -1794,7 +1794,19 @@ Devuelve ÚNICAMENTE JSON válido (sin texto antes ni después, sin \`\`\`json) 
     {"t":"img","idx":0},
     {"t":"table","idx":0}
   ]
-}`;
+}
+
+═══ REGLAS DE JSON VÁLIDO (CRÍTICAS) ═══
+- Si el texto original contiene COMILLAS DOBLES (p.ej. una cita: el autor afirma "X"), debes
+  ESCAPARLAS como \\" dentro del campo "text". Ejemplo correcto:
+    {"t":"p","text":"El autor afirma \\"la gestión pública\\" como pilar."}
+  NUNCA dejes una " sin escapar dentro de un string — el JSON quedará inválido y el documento
+  no podrá maquetarse.
+- Alternativa más segura: SUSTITUYE las comillas dobles del texto original por COMILLAS
+  TIPOGRÁFICAS «» o "" (U+00AB/U+00BB o U+201C/U+201D). Estas no rompen el JSON.
+- Los saltos de línea dentro de un "text" deben escaparse como \\n. Lo más limpio: no metas
+  saltos de línea; usa puntos y separa en párrafos distintos ({"t":"p",...} consecutivos).
+- Los retrocesos (\\) en el texto original deben escaparse como \\\\.`;
 }
 
 // Intenta recuperar JSON parcial cuando llega truncado por max_tokens.
@@ -1821,27 +1833,50 @@ function tryRecoverJson(s) {
   return s.substring(0, lastBlockEnd + 1) + ']}';
 }
 
+// jsonrepair: librería estándar para reparar JSON con errores comunes
+// (comillas no escapadas, comas finales, truncamientos, valores sin comillas…).
+// Es lo que arregla el caso típico de Claude metiendo `"` dentro de un string
+// de texto literal sin escaparlas → `Expected ',' or '}' after property value`.
+const { jsonrepair } = require('jsonrepair');
+
 function parseMaqJson(raw) {
   let s = raw.replace(/```json|```/g,'').trim();
   const si = s.indexOf('{'), ei = s.lastIndexOf('}') + 1;
   if (si >= 0 && ei > si) s = s.substring(si, ei);
   let data;
+  let repaired = false;
   try {
     data = JSON.parse(s);
   } catch (e) {
-    const recovered = tryRecoverJson(s);
-    if (recovered) {
-      try {
-        data = JSON.parse(recovered);
-        data._truncated = true; // marca para reportar al frontend
-      } catch (_) {
-        throw new Error('JSON inválido y no recuperable: ' + e.message);
+    // 1) Intentar con jsonrepair (comillas mal escapadas, comas sobrantes, etc.).
+    try {
+      const fixed = jsonrepair(s);
+      data = JSON.parse(fixed);
+      repaired = true;
+    } catch (_) {
+      // 2) Si jsonrepair no puede, intentar recuperar truncado al final.
+      const recovered = tryRecoverJson(s);
+      if (recovered) {
+        try {
+          data = JSON.parse(recovered);
+          data._truncated = true;
+        } catch (_) {
+          // 3) Último intento: jsonrepair sobre el recovered.
+          try {
+            data = JSON.parse(jsonrepair(recovered));
+            data._truncated = true;
+            repaired = true;
+          } catch (_) {
+            throw new Error('JSON inválido y no recuperable: ' + e.message);
+          }
+        }
+      } else {
+        throw new Error('JSON inválido: ' + e.message);
       }
-    } else {
-      throw new Error('JSON inválido: ' + e.message);
     }
   }
   if (!data.blocks || !Array.isArray(data.blocks)) throw new Error('JSON inválido: falta blocks[]');
+  if (repaired) data._repaired = true;
   return data;
 }
 
